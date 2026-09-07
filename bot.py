@@ -947,6 +947,23 @@ async def safe_send(admin_id: int, text: str, reply_markup=None):
         logger.error(f"Неизвестная ошибка при отправке админу {admin_id}: {e}")
 
 
+async def notify_admins_about_application_decision(app, admin_name: str, actor_id: int, decision: str):
+    """Отправляет другим админам единый пинг о решении по заявке."""
+    action = "одобрил" if decision == "approved" else "отклонил"
+    emoji = "✅" if decision == "approved" else "❌"
+    app_type = "оператора" if app["app_type"] == "operator" else "скаута"
+    full_name = app["full_name"] or "Без имени"
+    username = app["username"] or "без username"
+    text = (
+        f"{emoji} <b>{admin_name} {action} заявку #{app['id']}</b>\n"
+        f"Тип: {app_type}\n"
+        f"Кандидат: {full_name}\n"
+        f"Контакт: {username}"
+    )
+    for other_admin_id in ADMIN_IDS:
+        if other_admin_id != actor_id:
+            await safe_send(other_admin_id, text)
+
 @dp.errors()
 async def global_error_handler(event: types.ErrorEvent) -> bool:
     import traceback
@@ -1920,12 +1937,9 @@ async def callbacks(callback: types.CallbackQuery):
             await callback.answer(f"✅ Одобрено в {squad_name}!", show_alert=False)
         except Exception:
             pass
-        for other_admin_id in ADMIN_IDS:
-            if other_admin_id != user_id:
-                await safe_send(
-                    other_admin_id,
-                    f"✅ <b>{admin_name} одобрил заявку #{app_id}</b> → {squad_name}"
-                )
+        await notify_admins_about_application_decision(
+            app, admin_name, user_id, "approved"
+        )
         try:
             await callback.message.edit_text(
                 callback.message.text + f"\n\n✅ <b>Одобрено в {squad_name}</b> · {admin_name}",
@@ -2070,12 +2084,9 @@ async def callbacks(callback: types.CallbackQuery):
             await callback.answer("❌ Заявка отклонена.", show_alert=False)
         except Exception:
             pass
-        for other_admin_id in ADMIN_IDS:
-            if other_admin_id != user_id:
-                await safe_send(
-                    other_admin_id,
-                    f"❌ <b>{admin_name} отклонил заявку скаута #{app_id}</b>"
-                )
+        await notify_admins_about_application_decision(
+            app, admin_name, user_id, "rejected"
+        )
         try:
             await callback.message.edit_text(
                 callback.message.text + f"\n\n❌ <b>Отклонено</b> · {admin_name}",
