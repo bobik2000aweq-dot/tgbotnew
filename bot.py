@@ -625,8 +625,8 @@ async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int,
 async def _submit_operator_request_to_crm(app, slot_id: int, slot):
     try:
         status, payload = await _huntme_create_operator_request(app, slot_id, slot)
-        if status in (200, 201):
-            logger.info(f"Заявка #{app['id']} отправлена в CRM после бронирования слота #{slot_id}")
+        if status in (200, 201, 202):
+            logger.info(f"Заявка #{app['id']} отправлена в CRM после бронирования слота #{slot_id}: HTTP {status}; ответ={payload}")
         else:
             logger.error(f"Не удалось отправить заявку #{app['id']} в CRM: HTTP {status}; ответ={payload}")
     except Exception as exc:
@@ -1390,8 +1390,9 @@ async def callbacks(callback: types.CallbackQuery):
                 pass
             return
         slot_text = slot_record["slot_text"]
-        # CRM отправка не блокирует подтверждение пользователю.
-        asyncio.create_task(_submit_operator_request_to_crm(_bk_check, slot_id, slot_record))
+        # Сначала гарантированно отправляем заявку в CRM, затем подтверждаем запись пользователю.
+        # Бронь уже сохранена локально и не откатывается при ошибке CRM.
+        await _submit_operator_request_to_crm(_bk_check, slot_id, slot_record)
         if not is_admin(_cb_user):
             await db_set_cooldown(user_id, "operator")
         try:
