@@ -2893,7 +2893,7 @@ async def sync_huntme_interview_slots() -> int:
 
     logger.info(
         f"Слоты CRM синхронизированы по {len(offices)} офисам: доступно {len(desired)}, "
-        f"добавлено {added}, обновлено {updated}, удалено устаревших {removed}"
+        f"добавлено {added}, обновлено {updated_count}, удалено устаревших {removed}"
     )
     return len(desired)
 
