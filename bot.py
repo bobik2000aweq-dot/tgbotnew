@@ -675,17 +675,8 @@ async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int,
 
     target_date = slot_dt.strftime("%d.%m.%Y")
     target_time = slot_dt.strftime("%H:%M")
-    slots_status, slots_payload = await _huntme_json_request(
-        "GET",
-        "/interview-slots",
-        params={"office_id": office_id, "funnel": "operators"},
-    )
-    slots_data = slots_payload.get("data") if isinstance(slots_payload, dict) else None
-    if slots_status != 200:
-        return slots_status, {"message": "не удалось проверить слот в CRM", "details": slots_payload}
-    if not _huntme_slot_is_available(slots_data, slot_dt):
-        return 422, {"message": "выбранного времени уже нет среди свободных слотов CRM"}
-
+    # Не делаем отдельный GET-проверку: локальный слот уже пришёл из CRM,
+    # а POST ниже является финальной проверкой доступности и создаёт заявку.
     payload = {
         "category": 0,
         "office_id": office_id,
