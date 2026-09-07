@@ -2604,6 +2604,168 @@ async def _huntme_get_operator_offices() -> list[dict]:
         logger.warning(f"Не удалось получить офисы CRM: HTTP {status}; ответ={payload}")
     return [{"id": office_id, "label": f"Офис {office_id}"} for office_id in configured_ids]
 
+async def sync_huntme_interview_slots() -> int:
+    """Синхронизирует слоты CRM по всем доступным офисам, не удаляя ручные слоты."""
+    if not HUNTME_API_KEY:
+        logger.warning("Синхронизация слотов CRM пропущена: нет HUNTME_API_KEY")
+        return 0
+
+    offices = await _huntme_get_operator_offices()
+    if not offices:
+        logger.warning("В CRM не найдено доступных офисов для синхронизации слотов")
+        return 0
+
+    def parse_schedule(data):
+        schedule_items = []
+
+        def add_schedule_item(date_value, times_value):
+            if date_value and times_value:
+                if isinstance(times_value, (list, tuple)):
+                    schedule_items.append((date_value, list(times_value)))
+                else:
+                    schedule_items.append((date_value, [times_value]))
+
+        def add_combined_slot(value):
+            value = str(value)
+            date_match = re.search(
+                r"(\d{4}-\d{2}-\d{2}|\d{1,2}[.]\d{1,2}(?:[.]\d{4})?|\d{1,2}/\d{1,2}(?:/\d{4})?)",
+                value,
+            )
+            time_match = re.search(r"(\d{1,2}:\d{2})", value)
+            if date_match and time_match:
+                add_schedule_item(date_match.group(1), [time_match.group(1)])
+
+        if isinstance(data, dict):
+            if isinstance(data.get("slots"), list):
+                for item in data["slots"]:
+                    if isinstance(item, dict):
+                        date_value = item.get("date") or item.get("day") or item.get("interview_date")
+                        times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
+                        if date_value and times_value:
+                            add_schedule_item(date_value, times_value)
+                        else:
+                            add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
+                    else:
+                        add_combined_slot(item)
+            else:
+                for date_value, times_value in data.items():
+                    if date_value in {"office_id", "funnel", "timezone", "slots"}:
+                        continue
+                    add_schedule_item(date_value, times_value)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    date_value = item.get("date") or item.get("day") or item.get("interview_date")
+                    times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
+                    if date_value and times_value:
+                        add_schedule_item(date_value, times_value)
+                    else:
+                        add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
+                else:
+                    add_combined_slot(item)
+        return schedule_items
+
+    async def load_office_slots(office):
+        status, payload = await _huntme_json_request(
+            "GET",
+            "/interview-slots",
+            params={"office_id": office["id"], "funnel": "operators"},
+        )
+        if status != 200:
+            logger.error(f"Не удалось получить слоты CRM для офиса {office['id']}: HTTP {status}; ответ={payload}")
+            return office, []
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return office, parse_schedule(data)
+
+    office_schedules = await asyncio.gather(*(load_office_slots(office) for office in offices))
+    moscow = ZoneInfo("Europe/Moscow")
+    now = datetime.now(moscow).replace(tzinfo=None, second=0, microsecond=0)
+    horizon = now + timedelta(days=7)
+    desired = {}
+    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m")
+
+    for office, schedule_items in office_schedules:
+        for date_key, raw_times in schedule_items:
+            if not date_key:
+                continue
+            date_value = str(date_key).strip()[:10]
+            parsed_date = None
+            for date_format in date_formats:
+                try:
+                    parsed_date = datetime.strptime(date_value, date_format).date()
+                    if date_format == "%d.%m":
+                        parsed_date = parsed_date.replace(year=now.year)
+                    break
+                except ValueError:
+                    continue
+            if not parsed_date:
+                continue
+            if isinstance(raw_times, dict):
+                time_items = list(raw_times.keys())
+            elif isinstance(raw_times, list):
+                time_items = raw_times
+            else:
+                time_items = [raw_times]
+            for raw_time in time_items:
+                if isinstance(raw_time, dict):
+                    raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
+                if not raw_time:
+                    continue
+                time_match = re.search(r"(\d{1,2}:\d{2})", str(raw_time))
+                if not time_match:
+                    continue
+                try:
+                    slot_dt = datetime.combine(parsed_date, datetime.strptime(time_match.group(0), "%H:%M").time())
+                except ValueError:
+                    continue
+                if now <= slot_dt < horizon:
+                    slot_key = (slot_dt, office["id"])
+                    desired[slot_key] = f"{slot_dt:%d.%m %H:%M} — {office['label']}"
+
+    if not desired:
+        logger.warning("CRM не вернула распознаваемых свободных слотов ни для одного офиса")
+        return 0
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetch(
+            """
+            SELECT id, slot_text, slot_dt, is_booked, office_id, source
+            FROM interview_slots
+            WHERE slot_dt >= $1 AND slot_dt < $2
+            """,
+            now,
+            horizon,
+        )
+        existing_by_key = {(row["slot_dt"], row["office_id"]): row for row in existing}
+        added = 0
+        updated = 0
+        for (slot_dt, office_id), slot_text in desired.items():
+            row = existing_by_key.get((slot_dt, office_id))
+            if row is None:
+                await conn.execute(
+                    "INSERT INTO interview_slots (slot_text, slot_dt, office_id, source) VALUES ($1, $2, $3, 'crm')",
+                    slot_text,
+                    slot_dt,
+                    office_id,
+                )
+                added += 1
+            elif not row["is_booked"] and row["source"] == "crm" and row["slot_text"] != slot_text:
+                await conn.execute("UPDATE interview_slots SET slot_text=$1 WHERE id=$2", slot_text, row["id"])
+                updated += 1
+        removed = 0
+        desired_keys = set(desired)
+        for row in existing:
+            row_key = (row["slot_dt"], row["office_id"])
+            if not row["is_booked"] and row["source"] == "crm" and row_key not in desired_keys:
+                await conn.execute("DELETE FROM interview_slots WHERE id=$1", row["id"])
+                removed += 1
+
+    logger.info(
+        f"Слоты CRM синхронизированы по {len(offices)} офисам: доступно {len(desired)}, "
+        f"добавлено {added}, обновлено {updated}, удалено устаревших {removed}"
+    )
+    return len(desired)
+
 async def huntme_slots_sync_loop():
     """Обновляет меню собеседований каждый день в 03:05 по Москве."""
     moscow = ZoneInfo("Europe/Moscow")
