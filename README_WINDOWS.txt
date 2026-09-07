@@ -21,13 +21,19 @@ Used by the AI screening feature:
 Configured for Huntme:
   HUNTME_API_KEY
   HUNTME_API_BASE_URL (optional; defaults to https://apihmscout.com/api/employee-api-key)
+  HUNTME_OPERATOR_OFFICE_ID (required for operator applications)
+  HUNTME_TIMEOUT_SECONDS (optional; defaults to 20)
 
 Example for the current Windows terminal:
   set TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_TOKEN
   set DATABASE_URL=YOUR_DATABASE_URL
-  set HUNTME_API_KEY=YOUR_HUNTME_KEY
+  set HUNTME_API_KEY=YOUR_EMPLOYEE_API_KEY
+  set HUNTME_OPERATOR_OFFICE_ID=12
   set AI_INTEGRATIONS_OPENAI_API_KEY=YOUR_OPENAI_KEY
   dist\hlustyak_bot.exe
+
+
+When an operator selects an interview slot, the bot checks it against the CRM and sends it to POST /request-call/operator. The local application is saved first, so a CRM outage does not lose it. An administrator can use /huntme_offices to list accessible office IDs.
 
 The image is bundled into the executable by PyInstaller, so welcome.png is
 needed only while building and does not need to be distributed with the EXE.
