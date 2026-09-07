@@ -2598,11 +2598,7 @@ async def _huntme_get_operator_offices() -> list[dict]:
         offices.append({"id": office_id, "label": label})
 
     if offices:
-        if configured_ids:
-            configured_set = set(configured_ids)
-            offices = [office for office in offices if office["id"] in configured_set]
-        if offices:
-            return offices
+        return offices
 
     if status != 200:
         logger.warning(f"Не удалось получить офисы CRM: HTTP {status}; ответ={payload}")
