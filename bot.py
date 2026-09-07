@@ -41,6 +41,7 @@ HUNTME_API_BASE_URL = os.environ.get(
     "https://apihmscout.com/api/employee-api-key",
 ).rstrip("/")
 HUNTME_OPERATOR_OFFICE_ID = os.environ.get("HUNTME_OPERATOR_OFFICE_ID")
+HUNTME_OPERATOR_OFFICE_IDS = os.environ.get("HUNTME_OPERATOR_OFFICE_IDS", "")
 HUNTME_TIMEOUT_SECONDS = int(os.environ.get("HUNTME_TIMEOUT_SECONDS", "20"))
 ADMIN_IDS = [8123065501, 8288307098, 7387962932]
 DATABASE_URL = os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
@@ -317,9 +318,13 @@ async def db_mark_greeted(user_id: int):
 
 async def db_add_interview_slots(slots: list):
     async with db_pool.acquire() as conn:
+        normalized_slots = [
+            (slot[0], slot[1], slot[2] if len(slot) > 2 else None, "manual")
+            for slot in slots
+        ]
         await conn.executemany(
-            "INSERT INTO interview_slots (slot_text, slot_dt) VALUES ($1, $2)",
-            slots
+            "INSERT INTO interview_slots (slot_text, slot_dt, office_id, source) VALUES ($1, $2, $3, $4)",
+            normalized_slots
         )
 
 
@@ -378,7 +383,7 @@ async def db_get_slot_text(slot_id: int) -> str | None:
 async def db_get_slot_by_id(slot_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, slot_text, slot_dt FROM interview_slots WHERE id=$1",
+            "SELECT id, slot_text, slot_dt, office_id FROM interview_slots WHERE id=$1",
             slot_id,
         )
 
@@ -592,12 +597,16 @@ def _huntme_slot_is_available(payload_data, target_dt: datetime) -> bool:
 
 
 async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int, object]:
-    if not HUNTME_OPERATOR_OFFICE_ID:
-        return 0, {"message": "HUNTME_OPERATOR_OFFICE_ID не задан"}
+    office_id_value = None
+    if slot and "office_id" in slot.keys():
+        office_id_value = slot["office_id"]
+    office_id_value = office_id_value or HUNTME_OPERATOR_OFFICE_ID
+    if not office_id_value:
+        return 0, {"message": "для слота не определён офис CRM"}
     try:
-        office_id = int(HUNTME_OPERATOR_OFFICE_ID)
-    except ValueError:
-        return 0, {"message": "HUNTME_OPERATOR_OFFICE_ID должен быть числом"}
+        office_id = int(office_id_value)
+    except (TypeError, ValueError):
+        return 0, {"message": "ID офиса CRM должен быть числом"}
 
     app_text = app["app_text"] or ""
     name = extract_form_field(app_text, "имя") or app["full_name"] or ""
@@ -651,7 +660,6 @@ async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int,
         json_body=payload,
         headers=headers,
     )
-
 
 async def db_get_scout_referrals() -> dict:
     async with db_pool.acquire() as conn:
@@ -1074,7 +1082,7 @@ async def show_admin_date_slots(message, date_str: str):
         return
     rows = []
     for s in slots:
-        time_part = s["slot_text"].split(" ")[1] if " " in s["slot_text"] else s["slot_text"]
+        time_part = s["slot_text"].split(" ", 1)[1] if " " in s["slot_text"] else s["slot_text"]
         if s["is_booked"]:
             label = f"✅ {time_part} — ID {s['booked_by_user_id']} (#{s['booked_app_id']})"
         else:
@@ -1090,53 +1098,47 @@ async def show_admin_date_slots(message, date_str: str):
 
 
 async def show_admin_interviews(target):
-    if HUNTME_API_KEY and HUNTME_OPERATOR_OFFICE_ID:
+    if HUNTME_API_KEY:
         try:
             await sync_huntme_interview_slots()
         except Exception as exc:
             logger.exception(f"Ошибка загрузки слотов CRM в админском меню: {exc}")
     dates = await db_get_slot_dates_summary()
-    crm_mode = bool(HUNTME_API_KEY and HUNTME_OPERATOR_OFFICE_ID)
+    crm_mode = bool(HUNTME_API_KEY)
     sep = "─" * 22
+    rows = []
     if not dates:
-        if crm_mode:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить из CRM", callback_data="admin_interviews_back")],
-            ])
-            text = f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\nCRM пока не вернула свободные слоты.\nРучная загрузка не требуется — нажмите обновить после появления слотов в CRM."
-        else:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Добавить даты", callback_data="interview_add")],
-            ])
-            text = f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\nСлотов пока нет.\nДобавьте даты, чтобы операторы могли записаться."
+        text = (
+            f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\n"
+            "Свободных слотов пока нет.\n"
+            "Можно обновить данные CRM или добавить даты вручную."
+        )
     else:
         total_free = sum(v["free"] for v in dates.values())
         total_booked = sum(v["booked"] for v in dates.values())
-        rows = []
         for date_part, counts in sorted(dates.items()):
             free_part = f"  🟢 {counts['free']} св." if counts["free"] else ""
             booked_part = f"  ✅ {counts['booked']} зап." if counts["booked"] else ""
             label = f"📅 {date_part}{free_part}{booked_part}"
             rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_idate:{date_part}")])
-        if crm_mode:
-            rows.append([InlineKeyboardButton(text="🔄 Обновить из CRM", callback_data="admin_interviews_back")])
-        else:
-            rows.append([InlineKeyboardButton(text="➕ Добавить даты", callback_data="interview_add")])
-        rows.append([InlineKeyboardButton(text="🗑 Очистить все слоты", callback_data="interview_clear")])
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
         text = (
             f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n"
             f"{sep}\n"
             f"🟢 Свободных слотов: <b>{total_free}</b>\n"
             f"✅ Занятых слотов: <b>{total_booked}</b>\n"
             f"{sep}\n"
-            f"Нажмите на дату для просмотра слотов:"
+            "Нажмите на дату для просмотра слотов:"
         )
+    if crm_mode:
+        rows.append([InlineKeyboardButton(text="🔄 Обновить из CRM", callback_data="admin_interviews_back")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить даты вручную", callback_data="interview_add")])
+    if dates:
+        rows.append([InlineKeyboardButton(text="🗑 Очистить все слоты", callback_data="interview_clear")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     if hasattr(target, "answer"):
         await target.answer(text, reply_markup=kb)
     else:
         await target.message.answer(text, reply_markup=kb)
-
 
 @dp.message(lambda m: m.text == "📅 Собеседования")
 async def admin_btn_interviews(message: types.Message):
@@ -1420,7 +1422,7 @@ async def callbacks(callback: types.CallbackQuery):
             pass
         rows = []
         for slot in all_slots:
-            time_part = slot["slot_text"].split(" ")[1] if " " in slot["slot_text"] else slot["slot_text"]
+            time_part = slot["slot_text"].split(" ", 1)[1] if " " in slot["slot_text"] else slot["slot_text"]
             rows.append([InlineKeyboardButton(
                 text=f"🕐 {time_part}",
                 callback_data=f"book_slot:{slot['id']}:{app_id}"
@@ -2551,158 +2553,60 @@ async def health_handler(request):
     )
 
 
-async def sync_huntme_interview_slots() -> int:
-    """Синхронизирует свободные слоты CRM в локальное меню бота."""
-    if not HUNTME_API_KEY or not HUNTME_OPERATOR_OFFICE_ID:
-        logger.warning("Синхронизация слотов CRM пропущена: нет HUNTME_API_KEY или HUNTME_OPERATOR_OFFICE_ID")
-        return 0
-    try:
-        office_id = int(HUNTME_OPERATOR_OFFICE_ID)
-    except ValueError:
-        logger.error("HUNTME_OPERATOR_OFFICE_ID должен быть числом")
-        return 0
+async def _huntme_get_operator_offices() -> list[dict]:
+    configured_ids = []
+    for raw_value in [HUNTME_OPERATOR_OFFICE_IDS, HUNTME_OPERATOR_OFFICE_ID]:
+        for raw_id in str(raw_value or "").split(","):
+            raw_id = raw_id.strip()
+            if raw_id and raw_id.isdigit() and int(raw_id) not in configured_ids:
+                configured_ids.append(int(raw_id))
 
     status, payload = await _huntme_json_request(
-        "GET",
-        "/interview-slots",
-        params={"office_id": office_id, "funnel": "operators"},
+        "GET", "/offices", params={"funnel": "operators"}
     )
-    if status != 200:
-        logger.error(f"Не удалось получить слоты CRM: HTTP {status}; ответ={payload}")
-        return 0
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if data is None:
-        logger.error(f"CRM вернула ответ без data: {payload}")
-        return 0
-
-    # Поддерживаем форматы CRM: дата -> времена, список слотов и ISO-строки.
-    schedule_items = []
-
-    def add_schedule_item(date_value, times_value):
-        if date_value and times_value:
-            if isinstance(times_value, (list, tuple)):
-                schedule_items.append((date_value, list(times_value)))
-            else:
-                schedule_items.append((date_value, [times_value]))
-
-    def add_combined_slot(value):
-        value = str(value)
-        date_match = re.search(
-            r"(\d{4}-\d{2}-\d{2}|\d{1,2}[.]\d{1,2}(?:[.]\d{4})?|\d{1,2}/\d{1,2}(?:/\d{4})?)",
-            value,
-        )
-        time_match = re.search(r"(\d{1,2}:\d{2})", value)
-        if date_match and time_match:
-            add_schedule_item(date_match.group(1), [time_match.group(1)])
-
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if data is None:
-        logger.error(f"CRM вернула ответ без data: {payload}")
-        return 0
-    if isinstance(data, dict):
-        if isinstance(data.get("slots"), list):
-            for item in data["slots"]:
-                if isinstance(item, dict):
-                    date_value = item.get("date") or item.get("day") or item.get("interview_date")
-                    times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
-                    if date_value and times_value:
-                        add_schedule_item(date_value, times_value)
-                    else:
-                        add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
-                else:
-                    add_combined_slot(item)
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    raw_offices = []
+    if isinstance(data, list):
+        raw_offices = data
+    elif isinstance(data, dict):
+        nested = data.get("offices") or data.get("items")
+        if isinstance(nested, list):
+            raw_offices = nested
         else:
-            for date_value, times_value in data.items():
-                if date_value in {"office_id", "funnel", "timezone", "slots"}:
+            for raw_id, value in data.items():
+                if raw_id in {"funnel", "timezone"}:
                     continue
-                add_schedule_item(date_value, times_value)
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                date_value = item.get("date") or item.get("day") or item.get("interview_date")
-                times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
-                if date_value and times_value:
-                    add_schedule_item(date_value, times_value)
-                else:
-                    add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
-            else:
-                add_combined_slot(item)
-    if not schedule_items:
-        logger.warning(f"CRM не вернула распознаваемых свободных слотов: {payload}")
-        return 0
+                if isinstance(value, dict):
+                    raw_offices.append({"office_id": raw_id, **value})
 
-    moscow = ZoneInfo("Europe/Moscow")
-    now = datetime.now(moscow).replace(tzinfo=None, second=0, microsecond=0)
-    horizon = now + timedelta(days=7)
-    desired = {}
-    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m")
-    for date_key, raw_times in schedule_items:
-        if not date_key:
+    offices = []
+    seen_ids = set()
+    for office in raw_offices:
+        if not isinstance(office, dict):
             continue
-        date_value = str(date_key).strip()[:10]
-        parsed_date = None
-        for date_format in date_formats:
-            try:
-                parsed_date = datetime.strptime(date_value, date_format).date()
-                if date_format == "%d.%m":
-                    parsed_date = parsed_date.replace(year=now.year)
-                break
-            except ValueError:
-                continue
-        if not parsed_date:
+        office_id = office.get("office_id") or office.get("id")
+        try:
+            office_id = int(office_id)
+        except (TypeError, ValueError):
             continue
-        if isinstance(raw_times, dict):
-            time_items = list(raw_times.keys())
-        elif isinstance(raw_times, list):
-            time_items = raw_times
-        else:
-            time_items = [raw_times]
-        for raw_time in time_items:
-            if isinstance(raw_time, dict):
-                raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
-            if not raw_time:
-                continue
-            time_match = re.search(r"(\d{1,2}):(\d{2})", str(raw_time))
-            if not time_match:
-                continue
-            try:
-                slot_dt = datetime.combine(parsed_date, datetime.strptime(time_match.group(0), "%H:%M").time())
-            except ValueError:
-                continue
-            if now <= slot_dt < horizon:
-                desired[slot_dt] = f"{slot_dt:%d.%m %H:%M}"
+        if office_id in seen_ids:
+            continue
+        seen_ids.add(office_id)
+        name = str(office.get("name") or office.get("city") or f"Офис {office_id}").strip()
+        city = str(office.get("city") or "").strip()
+        label = f"{name} ({city})" if city and city.lower() not in name.lower() else name
+        offices.append({"id": office_id, "label": label})
 
-    async with db_pool.acquire() as conn:
-        existing = await conn.fetch(
-            """
-            SELECT id, slot_text, slot_dt, is_booked
-            FROM interview_slots
-            WHERE slot_dt >= $1 AND slot_dt < $2
-            """,
-            now,
-            horizon,
-        )
-        existing_by_dt = {row["slot_dt"]: row for row in existing if row["slot_dt"]}
-        added = 0
-        for slot_dt, slot_text in desired.items():
-            if slot_dt not in existing_by_dt:
-                await conn.execute(
-                    "INSERT INTO interview_slots (slot_text, slot_dt) VALUES ($1, $2)",
-                    slot_text,
-                    slot_dt,
-                )
-                added += 1
-        removed = 0
-        for row in existing:
-            if not row["is_booked"] and row["slot_dt"] not in desired:
-                await conn.execute("DELETE FROM interview_slots WHERE id=$1", row["id"])
-                removed += 1
+    if offices:
+        if configured_ids:
+            configured_set = set(configured_ids)
+            offices = [office for office in offices if office["id"] in configured_set]
+        if offices:
+            return offices
 
-    logger.info(
-        f"Слоты CRM синхронизированы: доступно {len(desired)}, добавлено {added}, удалено устаревших {removed}"
-    )
-    return len(desired)
-
+    if status != 200:
+        logger.warning(f"Не удалось получить офисы CRM: HTTP {status}; ответ={payload}")
+    return [{"id": office_id, "label": f"Офис {office_id}"} for office_id in configured_ids]
 
 async def huntme_slots_sync_loop():
     """Обновляет меню собеседований каждый день в 03:05 по Москве."""
@@ -2854,6 +2758,8 @@ async def _init_db(db_url: str):
                 id SERIAL PRIMARY KEY,
                 slot_text TEXT NOT NULL,
                 slot_dt TIMESTAMP,
+                office_id BIGINT,
+                source TEXT NOT NULL DEFAULT 'manual',
                 is_booked BOOLEAN DEFAULT FALSE,
                 booked_by_user_id BIGINT,
                 booked_app_id INT,
@@ -2864,6 +2770,14 @@ async def _init_db(db_url: str):
         await conn.execute("""
             ALTER TABLE interview_slots
             ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS office_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'
         """)
         await conn.execute("""
             ALTER TABLE applications
