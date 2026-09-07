@@ -20,7 +20,7 @@ Used by the AI screening feature:
 
 Configured for Huntme:
   HUNTME_API_KEY
-  HUNTME_API_URL (optional; defaults to https://api.huntme.in/v1/investigate)
+  HUNTME_API_BASE_URL (optional; defaults to https://apihmscout.com/api/employee-api-key)
 
 Example for the current Windows terminal:
   set TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_TOKEN
