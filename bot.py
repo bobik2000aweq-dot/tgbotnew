@@ -1324,7 +1324,7 @@ async def callbacks(callback: types.CallbackQuery):
             await sync_huntme_interview_slots()
         except Exception as exc:
             logger.exception(f"Ошибка загрузки слотов CRM при открытии собеседования: {exc}")
-                dates = await db_get_free_slot_dates_summary()
+        dates = await db_get_free_slot_dates_summary()
         if not dates:
             try:
                 await callback.answer("Слотов для записи пока нет. Попробуйте позже.", show_alert=True)
@@ -1356,7 +1356,7 @@ async def callbacks(callback: types.CallbackQuery):
             await sync_huntme_interview_slots()
         except Exception as exc:
             logger.exception(f"Ошибка обновления слотов CRM при выборе даты: {exc}")
-                all_slots = await db_get_free_slots_for_date(date_str)
+        all_slots = await db_get_free_slots_for_date(date_str)
         if not all_slots:
             try:
                 await callback.answer("На эту дату слотов нет.", show_alert=True)
