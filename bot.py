@@ -125,6 +125,9 @@ def validate_operator_form(text: str) -> list[str]:
         if not found:
             missing.append(label)
 
+    if not re.search(r"(?<!\d)\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}(?!\d)", text):
+        missing.append("Дата рождения в формате ДД.ММ.ГГГГ")
+
     return missing
 
 
@@ -419,9 +422,66 @@ async def db_get_slot_text(slot_id: int) -> str | None:
 async def db_get_slot_by_id(slot_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, slot_text, slot_dt, office_id FROM interview_slots WHERE id=$1",
+            "SELECT id, slot_text, slot_dt, office_id, crm_status FROM interview_slots WHERE id=$1",
             slot_id,
         )
+
+
+async def db_mark_crm_result(slot_id: int, success: bool, status: int, payload):
+    """Persist CRM delivery state so failures are retried instead of lost."""
+    try:
+        details = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        details = str(payload)
+    details = details[:4000]
+    if success:
+        await db_pool.execute(
+            """
+            UPDATE interview_slots
+            SET crm_status='sent',
+                crm_last_error=NULL,
+                crm_attempts=crm_attempts + 1,
+                crm_next_attempt_at=NULL,
+                crm_sent_at=NOW()
+            WHERE id=$1
+            """,
+            slot_id,
+        )
+    else:
+        await db_pool.execute(
+            """
+            UPDATE interview_slots
+            SET crm_status='failed',
+                crm_last_error=$2,
+                crm_attempts=crm_attempts + 1,
+                crm_next_attempt_at=NOW() + INTERVAL '5 minutes'
+            WHERE id=$1
+            """,
+            slot_id,
+            f"HTTP {status}; {details}",
+        )
+
+
+async def db_get_crm_retry_slots():
+    return await db_pool.fetch(
+        """
+        SELECT
+            s.id AS slot_id,
+            s.slot_dt,
+            s.office_id,
+            a.id AS app_id,
+            a.full_name,
+            a.app_text,
+            s.crm_attempts
+        FROM interview_slots s
+        JOIN applications a ON a.id = s.booked_app_id
+        WHERE s.is_booked=TRUE
+          AND COALESCE(s.crm_status, 'pending') <> 'sent'
+          AND (s.crm_next_attempt_at IS NULL OR s.crm_next_attempt_at <= NOW())
+        ORDER BY s.id
+        LIMIT 20
+        """
+    )
 
 
 async def db_get_slot_by_app_id(app_id: int):
@@ -625,12 +685,46 @@ async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int,
 async def _submit_operator_request_to_crm(app, slot_id: int, slot):
     try:
         status, payload = await _huntme_create_operator_request(app, slot_id, slot)
-        if status in (200, 201, 202):
+        success = status in (200, 201, 202)
+        await db_mark_crm_result(slot_id, success, status, payload)
+        if success:
             logger.info(f"Заявка #{app['id']} отправлена в CRM после бронирования слота #{slot_id}: HTTP {status}; ответ={payload}")
         else:
-            logger.error(f"Не удалось отправить заявку #{app['id']} в CRM: HTTP {status}; ответ={payload}")
+            logger.error(
+                f"Не удалось отправить заявку #{app['id']} в CRM: HTTP {status}; "
+                f"попытка сохранена для повтора; ответ={payload}"
+            )
+        return success
     except Exception as exc:
-        logger.exception(f"Ошибка фоновой отправки заявки #{app['id']} в CRM: {exc}")
+        logger.exception(f"Ошибка отправки заявки #{app['id']} в CRM: {exc}")
+        try:
+            await db_mark_crm_result(slot_id, False, 0, {"message": str(exc)})
+        except Exception:
+            logger.exception(f"Не удалось сохранить ошибку CRM для слота #{slot_id}")
+        return False
+
+
+async def crm_retry_loop():
+    """Retry every failed CRM delivery, using the same idempotency key."""
+    while True:
+        try:
+            for row in await db_get_crm_retry_slots():
+                app = {
+                    "id": row["app_id"],
+                    "full_name": row["full_name"],
+                    "app_text": row["app_text"],
+                }
+                slot = {
+                    "id": row["slot_id"],
+                    "slot_dt": row["slot_dt"],
+                    "office_id": row["office_id"],
+                }
+                await _submit_operator_request_to_crm(app, row["slot_id"], slot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(f"Ошибка цикла повторной отправки CRM: {exc}")
+        await asyncio.sleep(60)
 
 
 async def db_get_scout_referrals() -> dict:
@@ -2644,6 +2738,11 @@ async def _init_db(db_url: str):
                 booked_by_user_id BIGINT,
                 booked_app_id INT,
                 reminder_sent BOOLEAN DEFAULT FALSE,
+            crm_status TEXT DEFAULT 'pending',
+            crm_last_error TEXT,
+            crm_attempts INT NOT NULL DEFAULT 0,
+            crm_next_attempt_at TIMESTAMPTZ,
+            crm_sent_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
@@ -2658,6 +2757,26 @@ async def _init_db(db_url: str):
         await conn.execute("""
             ALTER TABLE interview_slots
             ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS crm_status TEXT DEFAULT 'pending'
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS crm_last_error TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS crm_attempts INT NOT NULL DEFAULT 0
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS crm_next_attempt_at TIMESTAMPTZ
+        """)
+        await conn.execute("""
+            ALTER TABLE interview_slots
+            ADD COLUMN IF NOT EXISTS crm_sent_at TIMESTAMPTZ
         """)
         await conn.execute("""
             ALTER TABLE applications
@@ -2695,6 +2814,13 @@ async def _webhook_background_init(db_url: str):
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(cleanup_slots_loop())
     asyncio.create_task(reminder_loop())
+    asyncio.create_task(crm_retry_loop())
+    logger.info(
+        "HuntMe config: base=%s, api_key=%s, office_id=%s",
+        HUNTME_API_BASE_URL,
+        "set" if HUNTME_API_KEY else "MISSING",
+        HUNTME_OPERATOR_OFFICE_ID or "MISSING",
+    )
     logger.info("Фоновая инициализация завершена")
 
 
@@ -2726,6 +2852,13 @@ async def main():
         logger.info("Режим: Polling (dev)")
         await _init_db(db_url)
         await notify_admins_if_no_interview_slots()
+        asyncio.create_task(crm_retry_loop())
+        logger.info(
+            "HuntMe config: base=%s, api_key=%s, office_id=%s",
+            HUNTME_API_BASE_URL,
+            "set" if HUNTME_API_KEY else "MISSING",
+            HUNTME_OPERATOR_OFFICE_ID or "MISSING",
+        )
         webhook_info = await bot.get_webhook_info()
         if webhook_info.url:
             dev_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
