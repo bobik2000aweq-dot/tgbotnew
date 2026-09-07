@@ -607,61 +607,6 @@ async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int,
     )
 
 
-async def _huntme_create_agent_request(app) -> tuple[int, object]:
-    if not HUNTME_API_KEY:
-        raise RuntimeError("HUNTME_API_KEY не задан в переменных окружения")
-
-    app_text = app["app_text"] or ""
-    name = extract_form_field(app_text, "имя") or app["full_name"] or ""
-    birth_date = extract_form_field(app_text, "дата рождения", "возраст")
-    phone_value = extract_form_field(app_text, "телефон", "номер телефона", "номер")
-    telegram_value = extract_form_field(app_text, "телеграм", "telegram")
-    telegram = _normalize_telegram(telegram_value)
-    if not telegram and app["username"] and app["username"] != "без username":
-        telegram = _normalize_telegram(app["username"])
-    number = _normalize_phone(phone_value or "")
-
-    missing = []
-    if len(name.strip()) < 3:
-        missing.append("имя")
-    if not birth_date:
-        missing.append("дата рождения")
-    if not number:
-        missing.append("номер телефона")
-    if missing:
-        raise ValueError("В анкете не хватает: " + ", ".join(missing))
-
-    payload = {
-        "category": 0,
-        "payment_system": 0,
-        "name": name.strip()[:255],
-        "birth_date": birth_date.strip(),
-        "number": number,
-    }
-    if telegram:
-        payload["telegram"] = telegram
-
-    headers = {
-        "Authorization": f"Bearer {HUNTME_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Idempotency-Key": f"telegram-scout-{app['id']}",
-    }
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            f"{HUNTME_API_BASE_URL.rstrip('/')}/request-call/agent",
-            headers=headers,
-            json=payload,
-        ) as response:
-            raw = await response.text()
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                data = raw
-            return response.status, data
-
-
 async def db_get_scout_referrals() -> dict:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1846,29 +1791,6 @@ async def callbacks(callback: types.CallbackQuery):
                 await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
             except Exception:
                 pass
-            return
-        try:
-            huntme_status, huntme_result = await _huntme_create_agent_request(app)
-        except ValueError as e:
-            logger.warning(f"Huntme не принял заявку #{app_id}: {e}")
-            await callback.answer(f"❌ {e}", show_alert=True)
-            return
-        except Exception as e:
-            logger.error(f"Ошибка отправки заявки #{app_id} в Huntme: {e}")
-            await callback.answer(
-                "❌ Не удалось отправить заявку в Huntme. Проверь HUNTME_API_KEY и логи Railway.",
-                show_alert=True,
-            )
-            return
-        if huntme_status not in (200, 201):
-            logger.error(
-                f"Huntme отклонил заявку #{app_id}: HTTP {huntme_status}; "
-                f"ответ={huntme_result}"
-            )
-            await callback.answer(
-                f"❌ Huntme отклонил заявку (HTTP {huntme_status}).",
-                show_alert=True,
-            )
             return
         admin = callback.from_user
         admin_name = f"@{admin.username}" if admin.username else (admin.first_name or "Админ")
