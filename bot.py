@@ -347,11 +347,20 @@ async def db_get_booked_slot_for_app(app_id: int):
     return row["slot_text"] if row else None
 
 
-async def db_book_slot(slot_id: int, user_id: int, app_id: int):
+async def db_book_slot(slot_id: int, user_id: int, app_id: int) -> bool:
     async with db_pool.acquire() as conn:
-        await conn.execute(
+        result = await conn.execute(
             "UPDATE interview_slots SET is_booked=TRUE, booked_by_user_id=$2, booked_app_id=$3 WHERE id=$1 AND is_booked=FALSE",
             slot_id, user_id, app_id
+        )
+    return result == "UPDATE 1"
+
+
+async def db_release_slot(slot_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE interview_slots SET is_booked=FALSE, booked_by_user_id=NULL, booked_app_id=NULL, reminder_sent=FALSE WHERE id=$1",
+            slot_id,
         )
 
 
@@ -645,6 +654,18 @@ async def db_get_slot_dates_summary():
             dates[date_part]["booked"] += 1
         else:
             dates[date_part]["free"] += 1
+    return dates
+
+
+async def db_get_free_slot_dates_summary():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT slot_text FROM interview_slots WHERE is_booked=FALSE ORDER BY slot_dt ASC"
+        )
+    dates = {}
+    for row in rows:
+        date_part = row["slot_text"].split(" ")[0]
+        dates[date_part] = dates.get(date_part, 0) + 1
     return dates
 
 
@@ -1299,7 +1320,7 @@ async def callbacks(callback: types.CallbackQuery):
             except Exception:
                 pass
             return
-        dates = await db_get_slot_dates_summary()
+        dates = await db_get_free_slot_dates_summary()
         if not dates:
             try:
                 await callback.answer("Слотов для записи пока нет. Попробуйте позже.", show_alert=True)
@@ -1328,7 +1349,7 @@ async def callbacks(callback: types.CallbackQuery):
         parts = callback.data.split(":")
         date_str = parts[1]
         app_id = int(parts[2])
-        all_slots = await db_get_all_slots_for_date(date_str)
+        all_slots = await db_get_free_slots_for_date(date_str)
         if not all_slots:
             try:
                 await callback.answer("На эту дату слотов нет.", show_alert=True)
@@ -1372,7 +1393,13 @@ async def callbacks(callback: types.CallbackQuery):
             except Exception:
                 pass
             return
-        await db_book_slot(slot_id, user_id, app_id)
+        booked = await db_book_slot(slot_id, user_id, app_id)
+        if not booked:
+            try:
+                await callback.answer("Этот слот уже занят. Выберите другое время.", show_alert=True)
+            except Exception:
+                pass
+            return
         slot_text = slot_record["slot_text"]
         crm_line = ""
         if HUNTME_API_KEY:
@@ -1386,11 +1413,24 @@ async def callbacks(callback: types.CallbackQuery):
                     crm_line = f"\n🏢 <b>CRM:</b> заявка <code>{crm_id or 'создана'}</code>"
                 else:
                     reason = huntme_result.get("message", "ошибка API") if isinstance(huntme_result, dict) else str(huntme_result)
-                    crm_line = f"\n⚠️ <b>CRM:</b> не синхронизировано — {reason}"
+                    await db_release_slot(slot_id)
                     logger.error(f"Huntme operator sync failed for application #{app_id}: HTTP {huntme_status}; response={huntme_result}")
+                    try:
+                        await callback.answer("Слот уже занят или CRM временно недоступна. Выберите другое время.", show_alert=True)
+                        await callback.message.answer(
+                            "⚠️ Это время уже недоступно в CRM. Локальная запись освобождена, выберите другой слот."
+                        )
+                    except Exception:
+                        pass
+                    return
             except Exception as exc:
-                crm_line = "\n⚠️ <b>CRM:</b> ошибка синхронизации, заявка сохранена локально"
+                await db_release_slot(slot_id)
                 logger.exception(f"Huntme operator sync error for application #{app_id}: {exc}")
+                try:
+                    await callback.answer("CRM временно недоступна. Выберите другое время.", show_alert=True)
+                except Exception:
+                    pass
+                return
         try:
             await callback.answer(f"✅ Записан на {slot_text}", show_alert=True)
         except Exception:
@@ -2413,7 +2453,7 @@ async def handle_message(message: types.Message):
     )
 
     if app_type == "operator":
-        slots_summary = await db_get_slot_dates_summary()
+        slots_summary = await db_get_free_slot_dates_summary()
         if slots_summary:
             pending_operator_apps[user.id] = {
                 "app_id": app_id,
