@@ -76,6 +76,7 @@ pending_operator_apps = {}
 user_edit_state = {}
 pending_admin_confirm = {}
 pending_chat_requests = {}
+interview_slots_empty_notified = None
 
 SQUADS = {
     "k": ("kolla", "https://t.me/kollasquad"),
@@ -2604,6 +2605,34 @@ async def _huntme_get_operator_offices() -> list[dict]:
         logger.warning(f"Не удалось получить офисы CRM: HTTP {status}; ответ={payload}")
     return [{"id": office_id, "label": f"Офис {office_id}"} for office_id in configured_ids]
 
+async def notify_admins_if_no_interview_slots():
+    """Уведомляет админов, когда свободных дат нет, без повторного спама."""
+    global interview_slots_empty_notified
+    if db_pool is None:
+        return
+    try:
+        free_dates = await db_get_free_slot_dates_summary()
+    except Exception as exc:
+        logger.warning(f"Не удалось проверить наличие свободных дат для уведомления: {exc}")
+        return
+
+    has_free_slots = bool(free_dates)
+    if has_free_slots:
+        interview_slots_empty_notified = False
+        return
+    if interview_slots_empty_notified is True:
+        return
+
+    interview_slots_empty_notified = True
+    text = (
+        "🚨 <b>Нет дат для собеседований</b>\n\n"
+        "Свободных слотов сейчас нет. Проверьте расписание CRM по офисам "
+        "или добавьте даты вручную в разделе «📅 Собеседования»."
+    )
+    for admin_id in ADMIN_IDS:
+        await safe_send(admin_id, text)
+
+
 async def sync_huntme_interview_slots() -> int:
     """Синхронизирует слоты CRM по всем доступным офисам, не удаляя ручные слоты."""
     if not HUNTME_API_KEY:
@@ -2779,6 +2808,10 @@ async def huntme_slots_sync_loop():
             await sync_huntme_interview_slots()
         except Exception as exc:
             logger.exception(f"Ошибка ежедневной синхронизации слотов CRM: {exc}")
+        try:
+            await notify_admins_if_no_interview_slots()
+        except Exception as exc:
+            logger.exception(f"Ошибка уведомления админов об отсутствии дат: {exc}")
 
 
 async def cleanup_slots_loop():
@@ -2957,6 +2990,7 @@ async def _webhook_background_init(db_url: str):
     except Exception as e:
         logger.error(f"Ошибка установки webhook: {e}")
     await sync_huntme_interview_slots()
+    await notify_admins_if_no_interview_slots()
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(cleanup_slots_loop())
     asyncio.create_task(huntme_slots_sync_loop())
@@ -2992,6 +3026,7 @@ async def main():
         logger.info("Режим: Polling (dev)")
         await _init_db(db_url)
         await sync_huntme_interview_slots()
+        await notify_admins_if_no_interview_slots()
         webhook_info = await bot.get_webhook_info()
         if webhook_info.url:
             dev_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
