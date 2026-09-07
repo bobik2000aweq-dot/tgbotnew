@@ -3,7 +3,6 @@ import os
 import logging
 import re
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from aiohttp import web
 import aiohttp
 from aiogram import Bot, Dispatcher, types
@@ -17,15 +16,18 @@ from aiogram.types import FSInputFile
 from aiogram.client.session.aiohttp import AiohttpSession
 import asyncpg
 import sys
-import json
-import uuid
 from openai import AsyncOpenAI
 
+_ai_client = None
+
 def _get_ai_client():
-    return AsyncOpenAI(
-        api_key=os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY") or "dummy",
-        base_url=os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL") or None,
-    )
+    global _ai_client
+    if _ai_client is None:
+        _ai_client = AsyncOpenAI(
+            api_key=os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY") or "dummy",
+            base_url=os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL") or None,
+        )
+    return _ai_client
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
@@ -34,15 +36,6 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
-
-HUNTME_API_KEY = os.environ.get("HUNTME_API_KEY")
-HUNTME_API_BASE_URL = os.environ.get(
-    "HUNTME_API_BASE_URL",
-    "https://apihmscout.com/api/employee-api-key",
-).rstrip("/")
-HUNTME_OPERATOR_OFFICE_ID = os.environ.get("HUNTME_OPERATOR_OFFICE_ID")
-HUNTME_OPERATOR_OFFICE_IDS = os.environ.get("HUNTME_OPERATOR_OFFICE_IDS", "")
-HUNTME_TIMEOUT_SECONDS = int(os.environ.get("HUNTME_TIMEOUT_SECONDS", "20"))
 ADMIN_IDS = [8123065501, 8288307098, 7387962932]
 DATABASE_URL = os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
@@ -544,160 +537,6 @@ def extract_form_field(app_text: str, *keywords) -> str | None:
     return None
 
 
-def _normalize_phone(value: str) -> str:
-    phone = re.sub(r"[^\d+]", "", value or "")
-    if phone.startswith("8") and len(phone) == 11:
-        phone = "+7" + phone[1:]
-    return phone
-
-
-def _normalize_telegram(value: str) -> str | None:
-    telegram = (value or "").strip()
-    telegram = re.sub(r"^https?://t\.me/", "", telegram, flags=re.IGNORECASE)
-    telegram = telegram.lstrip("@").split("/", 1)[0]
-    if re.fullmatch(r"[a-zA-Z0-9_]{5,}", telegram):
-        return telegram
-    return None
-
-
-def _huntme_birth_date(app_text: str) -> str | None:
-    match = re.search(r"(?<!\d)(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4})(?!\d)", app_text)
-    if not match:
-        return None
-    raw = match.group(1).replace("/", ".").replace("-", ".")
-    try:
-        return datetime.strptime(raw, "%d.%m.%Y").strftime("%d.%m.%Y")
-    except ValueError:
-        return None
-
-
-async def _huntme_json_request(method: str, path: str, *, params=None, json_body=None, headers=None):
-    if not HUNTME_API_KEY:
-        return 0, {"message": "HUNTME_API_KEY не задан"}
-    request_headers = {
-        "Authorization": f"Bearer {HUNTME_API_KEY}",
-        "Accept": "application/json",
-    }
-    if headers:
-        request_headers.update(headers)
-    timeout = aiohttp.ClientTimeout(total=HUNTME_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(
-            method,
-            f"{HUNTME_API_BASE_URL}/{path.lstrip('/')}",
-            params=params,
-            json=json_body,
-            headers=request_headers,
-        ) as response:
-            raw = await response.text()
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
-                payload = raw
-            return response.status, payload
-
-def _huntme_slot_is_available(payload_data, target_dt: datetime) -> bool:
-    """Проверяет слот в разных форматах ответа CRM, включая data.slots."""
-    target_date = target_dt.date()
-    target_time = target_dt.strftime("%H:%M")
-    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m")
-
-    def parse_date(value):
-        text = str(value or "").strip()
-        for date_format in date_formats:
-            try:
-                parsed = datetime.strptime(text[:10], date_format).date()
-                if date_format == "%d.%m":
-                    parsed = parsed.replace(year=target_date.year)
-                return parsed
-            except ValueError:
-                continue
-        return None
-
-    def time_matches(value):
-        if isinstance(value, dict):
-            return any(time_matches(child) for child in value.values())
-        if isinstance(value, (list, tuple)):
-            return any(time_matches(child) for child in value)
-        match = re.search(r"(\d{1,2}:\d{2})", str(value or ""))
-        return bool(match and match.group(1) == target_time)
-
-    def walk(value):
-        if isinstance(value, dict):
-            date_value = value.get("date") or value.get("day") or value.get("interview_date")
-            times_value = value.get("times") or value.get("available_times") or value.get("time") or value.get("start_time") or value.get("start")
-            if date_value and parse_date(date_value) == target_date and time_matches(times_value):
-                return True
-            for key, child in value.items():
-                if parse_date(key) == target_date and time_matches(child):
-                    return True
-                if walk(child):
-                    return True
-            return False
-        if isinstance(value, (list, tuple)):
-            return any(walk(child) for child in value)
-        text = str(value or "")
-        date_match = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[.]\d{1,2}(?:[.]\d{4})?|\d{1,2}/\d{1,2}(?:/\d{4})?)", text)
-        return bool(date_match and parse_date(date_match.group(1)) == target_date and time_matches(text))
-
-    return walk(payload_data)
-
-async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int, object]:
-    office_id_value = None
-    if slot and "office_id" in slot.keys():
-        office_id_value = slot["office_id"]
-    office_id_value = office_id_value or HUNTME_OPERATOR_OFFICE_ID
-    if not office_id_value:
-        return 0, {"message": "для слота не определён офис CRM"}
-    try:
-        office_id = int(office_id_value)
-    except (TypeError, ValueError):
-        return 0, {"message": "ID офиса CRM должен быть числом"}
-
-    app_text = app["app_text"] or ""
-    name = extract_form_field(app_text, "имя") or app["full_name"] or ""
-    birth_date = _huntme_birth_date(app_text)
-    phone_value = extract_form_field(app_text, "телефон", "номер телефона", "номер")
-    number = _normalize_phone(phone_value or "")
-    telegram = _normalize_telegram(extract_form_field(app_text, "телеграм", "telegram") or "")
-    slot_dt = slot["slot_dt"] if slot else None
-    missing = []
-    if len(name.strip()) < 3:
-        missing.append("имя")
-    if not birth_date:
-        missing.append("дата рождения в формате ДД.ММ.ГГГГ")
-    if not number or not (10 <= len(re.sub(r"\D", "", number)) <= 15):
-        missing.append("номер телефона")
-    if missing:
-        return 422, {"message": "В анкете не хватает: " + ", ".join(missing)}
-    if not slot_dt:
-        return 422, {"message": "у локального слота нет даты"}
-
-    target_date = slot_dt.strftime("%d.%m.%Y")
-    target_time = slot_dt.strftime("%H:%M")
-    # Не делаем отдельный GET-проверку: локальный слот уже пришёл из CRM,
-    # а POST ниже является финальной проверкой доступности и создаёт заявку.
-    payload = {
-        "category": 0,
-        "office_id": office_id,
-        "interview_appointment_date": f"{target_date} {target_time}",
-        "name": name.strip()[:255],
-        "birth_date": birth_date,
-        "number": number,
-    }
-    if telegram:
-        payload["telegram"] = telegram
-    headers = {
-        "Content-Type": "application/json",
-        "Idempotency-Key": str(uuid.uuid5(uuid.NAMESPACE_URL, f"hlustyak-operator:{app['id']}:{slot_id}")),
-    }
-    return await _huntme_json_request(
-        "POST",
-        "/request-call/operator",
-        json_body=payload,
-        headers=headers,
-    )
-
 async def db_get_scout_referrals() -> dict:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -724,30 +563,25 @@ async def db_get_scout_referrals() -> dict:
 async def db_get_slot_dates_summary():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT slot_text, is_booked FROM interview_slots ORDER BY slot_dt ASC"
+            """
+            SELECT TO_CHAR(slot_dt, 'DD.MM') AS date_part, COUNT(*) FILTER (WHERE is_booked = FALSE) AS free, COUNT(*) FILTER (WHERE is_booked = TRUE) AS booked, MIN(slot_dt) AS first_slot
+            FROM interview_slots WHERE slot_dt IS NOT NULL
+            GROUP BY TO_CHAR(slot_dt, 'DD.MM') ORDER BY first_slot ASC
+            """
         )
-    dates = {}
-    for r in rows:
-        date_part = r["slot_text"].split(" ")[0]
-        if date_part not in dates:
-            dates[date_part] = {"free": 0, "booked": 0}
-        if r["is_booked"]:
-            dates[date_part]["booked"] += 1
-        else:
-            dates[date_part]["free"] += 1
-    return dates
+    return {row["date_part"]: {"free": row["free"], "booked": row["booked"]} for row in rows}
 
 
 async def db_get_free_slot_dates_summary():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT slot_text FROM interview_slots WHERE is_booked=FALSE ORDER BY slot_dt ASC"
+            """
+            SELECT TO_CHAR(slot_dt, 'DD.MM') AS date_part, COUNT(*) AS total
+            FROM interview_slots WHERE is_booked = FALSE AND slot_dt IS NOT NULL
+            GROUP BY TO_CHAR(slot_dt, 'DD.MM') ORDER BY MIN(slot_dt) ASC
+            """
         )
-    dates = {}
-    for row in rows:
-        date_part = row["slot_text"].split(" ")[0]
-        dates[date_part] = dates.get(date_part, 0) + 1
-    return dates
+    return {row["date_part"]: row["total"] for row in rows}
 
 
 async def send_welcome(message: types.Message):
@@ -1152,21 +986,11 @@ async def show_admin_date_slots(message, date_str: str):
 
 
 async def show_admin_interviews(target):
-    if HUNTME_API_KEY:
-        try:
-            await sync_huntme_interview_slots()
-        except Exception as exc:
-            logger.exception(f"Ошибка загрузки слотов CRM в админском меню: {exc}")
     dates = await db_get_slot_dates_summary()
-    crm_mode = bool(HUNTME_API_KEY)
     sep = "─" * 22
     rows = []
     if not dates:
-        text = (
-            f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\n"
-            "Свободных слотов пока нет.\n"
-            "Можно обновить данные CRM или добавить даты вручную."
-        )
+        text = (f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\n" "Свободных слотов пока нет.\n" "Добавьте даты вручную через кнопку ниже.")
     else:
         total_free = sum(v["free"] for v in dates.values())
         total_booked = sum(v["booked"] for v in dates.values())
@@ -1175,24 +999,12 @@ async def show_admin_interviews(target):
             booked_part = f"  ✅ {counts['booked']} зап." if counts["booked"] else ""
             label = f"📅 {date_part}{free_part}{booked_part}"
             rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_idate:{date_part}")])
-        text = (
-            f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n"
-            f"{sep}\n"
-            f"🟢 Свободных слотов: <b>{total_free}</b>\n"
-            f"✅ Занятых слотов: <b>{total_booked}</b>\n"
-            f"{sep}\n"
-            "Нажмите на дату для просмотра слотов:"
-        )
-    if crm_mode:
-        rows.append([InlineKeyboardButton(text="🔄 Обновить из CRM", callback_data="admin_interviews_back")])
+        text=(f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n" f"{sep}\n" f"🟢 Свободных слотов: <b>{total_free}</b>\n" f"✅ Занятых слотов: <b>{total_booked}</b>\n" f"{sep}\n" "Нажмите на дату для просмотра слотов:")
     rows.append([InlineKeyboardButton(text="➕ Добавить даты вручную", callback_data="interview_add")])
-    if dates:
-        rows.append([InlineKeyboardButton(text="🗑 Очистить все слоты", callback_data="interview_clear")])
+    if dates: rows.append([InlineKeyboardButton(text="🗑 Очистить все слоты", callback_data="interview_clear")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    if hasattr(target, "answer"):
-        await target.answer(text, reply_markup=kb)
-    else:
-        await target.message.answer(text, reply_markup=kb)
+    if hasattr(target,"answer"): await target.answer(text,reply_markup=kb)
+    else: await target.message.answer(text,reply_markup=kb)
 
 @dp.message(lambda m: m.text == "📅 Собеседования")
 async def admin_btn_interviews(message: types.Message):
@@ -1260,31 +1072,6 @@ async def applications_cmd(message: types.Message):
         "📋 <b>Просмотр заявок</b>\n\nВыберите тип заявок:",
         reply_markup=await admin_applications_keyboard()
     )
-
-
-@dp.message(Command("huntme_offices"))
-async def huntme_offices_cmd(message: types.Message):
-    if not is_admin(message.from_user):
-        return
-    status, payload = await _huntme_json_request(
-        "GET", "/offices", params={"funnel": "operators"}
-    )
-    if status != 200:
-        reason = payload.get("message", "ошибка API") if isinstance(payload, dict) else str(payload)
-        await message.answer(f"⚠️ Не удалось получить офисы CRM: {reason}")
-        return
-    offices = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(offices, list) or not offices:
-        await message.answer("📭 Для воронки операторов доступных офисов нет.")
-        return
-    lines = ["🏢 <b>Офисы CRM для операторов</b>\n"]
-    for office in offices:
-        lines.append(
-            f"• <code>{office.get('office_id')}</code> — "
-            f"{office.get('name') or 'Без названия'} ({office.get('city') or 'город не указан'})"
-        )
-    lines.append("\nУкажи нужный ID в HUNTME_OPERATOR_OFFICE_ID.")
-    await message.answer("\n".join(lines))
 
 
 @dp.callback_query()
@@ -1427,10 +1214,6 @@ async def callbacks(callback: types.CallbackQuery):
             except Exception:
                 pass
             return
-        try:
-            await sync_huntme_interview_slots()
-        except Exception as exc:
-            logger.exception(f"Ошибка загрузки слотов CRM при открытии собеседования: {exc}")
         dates = await db_get_free_slot_dates_summary()
         if not dates:
             try:
@@ -1459,10 +1242,6 @@ async def callbacks(callback: types.CallbackQuery):
         parts = callback.data.split(":")
         date_str = parts[1]
         app_id = int(parts[2])
-        try:
-            await sync_huntme_interview_slots()
-        except Exception as exc:
-            logger.exception(f"Ошибка обновления слотов CRM при выборе даты: {exc}")
         all_slots = await db_get_free_slots_for_date(date_str)
         if not all_slots:
             try:
@@ -1515,36 +1294,6 @@ async def callbacks(callback: types.CallbackQuery):
                 pass
             return
         slot_text = slot_record["slot_text"]
-        crm_line = ""
-        if HUNTME_API_KEY:
-            try:
-                huntme_status, huntme_result = await _huntme_create_operator_request(
-                    _bk_check, slot_id, slot_record
-                )
-                if huntme_status in (200, 201):
-                    crm_data = huntme_result.get("data", huntme_result) if isinstance(huntme_result, dict) else {}
-                    crm_id = crm_data.get("uniqid") if isinstance(crm_data, dict) else None
-                    crm_line = f"\n🏢 <b>CRM:</b> заявка <code>{crm_id or 'создана'}</code>"
-                else:
-                    reason = huntme_result.get("message", "ошибка API") if isinstance(huntme_result, dict) else str(huntme_result)
-                    await db_release_slot(slot_id)
-                    logger.error(f"Huntme operator sync failed for application #{app_id}: HTTP {huntme_status}; response={huntme_result}")
-                    try:
-                        await callback.answer("Слот уже занят или CRM временно недоступна. Выберите другое время.", show_alert=True)
-                        await callback.message.answer(
-                            "⚠️ Это время уже недоступно в CRM. Локальная запись освобождена, выберите другой слот."
-                        )
-                    except Exception:
-                        pass
-                    return
-            except Exception as exc:
-                await db_release_slot(slot_id)
-                logger.exception(f"Huntme operator sync error for application #{app_id}: {exc}")
-                try:
-                    await callback.answer("CRM временно недоступна. Выберите другое время.", show_alert=True)
-                except Exception:
-                    pass
-                return
         if not is_admin(_cb_user):
             await db_set_cooldown(user_id, "operator")
         try:
@@ -1596,7 +1345,7 @@ async def callbacks(callback: types.CallbackQuery):
                     f"🔗 {username_str}  ·  🆔 <code>{user_id}</code>\n"
                     f"\n\n👁 @werolk @whyisrey"
                 )
-        full_admin_msg = base_msg + f"\n{sep}\n📅 <b>Собеседование: {slot_text}</b>" + crm_line
+        full_admin_msg = base_msg + f"\n{sep}\n📅 <b>Собеседование: {slot_text}</b>"
         for admin_id in ADMIN_IDS:
             await safe_send(admin_id, full_admin_msg, reply_markup=admin_notify_keyboard("operator", app_id))
         return
@@ -2627,57 +2376,6 @@ async def health_handler(request):
     )
 
 
-async def _huntme_get_operator_offices() -> list[dict]:
-    configured_ids = []
-    for raw_value in [HUNTME_OPERATOR_OFFICE_IDS, HUNTME_OPERATOR_OFFICE_ID]:
-        for raw_id in str(raw_value or "").split(","):
-            raw_id = raw_id.strip()
-            if raw_id and raw_id.isdigit() and int(raw_id) not in configured_ids:
-                configured_ids.append(int(raw_id))
-
-    status, payload = await _huntme_json_request(
-        "GET", "/offices", params={"funnel": "operators"}
-    )
-    data = payload.get("data") if isinstance(payload, dict) else payload
-    raw_offices = []
-    if isinstance(data, list):
-        raw_offices = data
-    elif isinstance(data, dict):
-        nested = data.get("offices") or data.get("items")
-        if isinstance(nested, list):
-            raw_offices = nested
-        else:
-            for raw_id, value in data.items():
-                if raw_id in {"funnel", "timezone"}:
-                    continue
-                if isinstance(value, dict):
-                    raw_offices.append({"office_id": raw_id, **value})
-
-    offices = []
-    seen_ids = set()
-    for office in raw_offices:
-        if not isinstance(office, dict):
-            continue
-        office_id = office.get("office_id") or office.get("id")
-        try:
-            office_id = int(office_id)
-        except (TypeError, ValueError):
-            continue
-        if office_id in seen_ids:
-            continue
-        seen_ids.add(office_id)
-        name = str(office.get("name") or office.get("city") or f"Офис {office_id}").strip()
-        city = str(office.get("city") or "").strip()
-        label = f"{name} ({city})" if city and city.lower() not in name.lower() else name
-        offices.append({"id": office_id, "label": label})
-
-    if offices:
-        return offices
-
-    if status != 200:
-        logger.warning(f"Не удалось получить офисы CRM: HTTP {status}; ответ={payload}")
-    return [{"id": office_id, "label": f"Офис {office_id}"} for office_id in configured_ids]
-
 async def notify_admins_if_no_interview_slots():
     """Уведомляет админов, когда свободных дат нет, без повторного спама."""
     global interview_slots_empty_notified
@@ -2699,212 +2397,11 @@ async def notify_admins_if_no_interview_slots():
     interview_slots_empty_notified = True
     text = (
         "🚨 <b>Нет дат для собеседований</b>\n\n"
-        "Свободных слотов сейчас нет. Проверьте расписание CRM по офисам "
-        "или добавьте даты вручную в разделе «📅 Собеседования»."
+        "Свободных слотов сейчас нет. Добавьте даты вручную "
+        "в разделе «📅 Собеседования»."
     )
     for admin_id in ADMIN_IDS:
         await safe_send(admin_id, text)
-
-
-async def sync_huntme_interview_slots() -> int:
-    """Синхронизирует слоты CRM по всем доступным офисам, не удаляя ручные слоты."""
-    if not HUNTME_API_KEY:
-        logger.warning("Синхронизация слотов CRM пропущена: нет HUNTME_API_KEY")
-        return 0
-
-    offices = await _huntme_get_operator_offices()
-    if not offices:
-        logger.warning("В CRM не найдено доступных офисов для синхронизации слотов")
-        return 0
-
-    def parse_schedule(data):
-        schedule_items = []
-
-        def add_schedule_item(date_value, times_value):
-            if date_value and times_value:
-                if isinstance(times_value, (list, tuple)):
-                    schedule_items.append((date_value, list(times_value)))
-                else:
-                    schedule_items.append((date_value, [times_value]))
-
-        def add_combined_slot(value):
-            value = str(value)
-            date_match = re.search(
-                r"(\d{4}-\d{2}-\d{2}|\d{1,2}[.]\d{1,2}(?:[.]\d{4})?|\d{1,2}/\d{1,2}(?:/\d{4})?)",
-                value,
-            )
-            time_match = re.search(r"(\d{1,2}:\d{2})", value)
-            if date_match and time_match:
-                add_schedule_item(date_match.group(1), [time_match.group(1)])
-
-        if isinstance(data, dict):
-            if isinstance(data.get("slots"), list):
-                for item in data["slots"]:
-                    if isinstance(item, dict):
-                        date_value = item.get("date") or item.get("day") or item.get("interview_date")
-                        times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
-                        if date_value and times_value:
-                            add_schedule_item(date_value, times_value)
-                        else:
-                            add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
-                    else:
-                        add_combined_slot(item)
-            else:
-                for date_value, times_value in data.items():
-                    if date_value in {"office_id", "funnel", "timezone", "slots"}:
-                        continue
-                    add_schedule_item(date_value, times_value)
-        elif isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    date_value = item.get("date") or item.get("day") or item.get("interview_date")
-                    times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
-                    if date_value and times_value:
-                        add_schedule_item(date_value, times_value)
-                    else:
-                        add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
-                else:
-                    add_combined_slot(item)
-        return schedule_items
-
-    async def load_office_slots(office):
-        status, payload = await _huntme_json_request(
-            "GET",
-            "/interview-slots",
-            params={"office_id": office["id"], "funnel": "operators"},
-        )
-        if status != 200:
-            logger.error(f"Не удалось получить слоты CRM для офиса {office['id']}: HTTP {status}; ответ={payload}")
-            return office, []
-        data = payload.get("data") if isinstance(payload, dict) else None
-        return office, parse_schedule(data)
-
-    office_schedules = await asyncio.gather(*(load_office_slots(office) for office in offices))
-    moscow = ZoneInfo("Europe/Moscow")
-    now = datetime.now(moscow).replace(tzinfo=None, second=0, microsecond=0)
-    horizon = now + timedelta(days=7)
-    desired = {}
-    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m")
-
-    for office, schedule_items in office_schedules:
-        for date_key, raw_times in schedule_items:
-            if not date_key:
-                continue
-            date_value = str(date_key).strip()[:10]
-            parsed_date = None
-            for date_format in date_formats:
-                try:
-                    parsed_date = datetime.strptime(date_value, date_format).date()
-                    if date_format == "%d.%m":
-                        parsed_date = parsed_date.replace(year=now.year)
-                    break
-                except ValueError:
-                    continue
-            if not parsed_date:
-                continue
-            if isinstance(raw_times, dict):
-                time_items = list(raw_times.keys())
-            elif isinstance(raw_times, list):
-                time_items = raw_times
-            else:
-                time_items = [raw_times]
-            for raw_time in time_items:
-                if isinstance(raw_time, dict):
-                    raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
-                if not raw_time:
-                    continue
-                time_match = re.search(r"(\d{1,2}:\d{2})", str(raw_time))
-                if not time_match:
-                    continue
-                try:
-                    slot_dt = datetime.combine(parsed_date, datetime.strptime(time_match.group(0), "%H:%M").time())
-                except ValueError:
-                    continue
-                if now <= slot_dt < horizon:
-                    desired.setdefault(
-                        slot_dt,
-                        (office["id"], f"{slot_dt:%d.%m %H:%M} — {office['label']}")
-                    )
-
-    if not desired:
-        logger.warning("CRM не вернула распознаваемых свободных слотов ни для одного офиса")
-        return 0
-
-    async with db_pool.acquire() as conn:
-        existing = await conn.fetch(
-            """
-            SELECT id, slot_text, slot_dt, is_booked, office_id, source
-            FROM interview_slots
-            WHERE slot_dt >= $1 AND slot_dt < $2
-            ORDER BY slot_dt ASC, is_booked DESC, id ASC
-            """,
-            now,
-            horizon,
-        )
-        existing_by_dt = {}
-        for row in existing:
-            current = existing_by_dt.get(row["slot_dt"])
-            if current is None or (row["is_booked"] and not current["is_booked"]):
-                existing_by_dt[row["slot_dt"]] = row
-
-        added = 0
-        updated_count = 0
-        for slot_dt, slot_data in desired.items():
-            office_id, slot_text = slot_data
-            row = existing_by_dt.get(slot_dt)
-            if row is None:
-                await conn.execute(
-                    "INSERT INTO interview_slots (slot_text, slot_dt, office_id, source) VALUES ($1, $2, $3, 'crm')",
-                    slot_text,
-                    slot_dt,
-                    office_id,
-                )
-                added += 1
-            elif not row["is_booked"] and row["source"] == "crm":
-                if row["slot_text"] != slot_text or row["office_id"] != office_id:
-                    await conn.execute(
-                        "UPDATE interview_slots SET slot_text=$1, office_id=$2 WHERE id=$3",
-                        slot_text,
-                        office_id,
-                        row["id"],
-                    )
-                    updated_count += 1
-
-        removed = 0
-        desired_dates = set(desired)
-        winner_ids = {row["id"] for row in existing_by_dt.values()}
-        for row in existing:
-            if (
-                not row["is_booked"]
-                and row["source"] == "crm"
-                and (row["slot_dt"] not in desired_dates or row["id"] not in winner_ids)
-            ):
-                await conn.execute("DELETE FROM interview_slots WHERE id=$1", row["id"])
-                removed += 1
-
-    logger.info(
-        f"Слоты CRM синхронизированы по {len(offices)} офисам: доступно {len(desired)}, "
-        f"добавлено {added}, обновлено {updated_count}, удалено устаревших {removed}"
-    )
-    return len(desired)
-
-async def huntme_slots_sync_loop():
-    """Обновляет меню собеседований каждый день в 03:05 по Москве."""
-    moscow = ZoneInfo("Europe/Moscow")
-    while True:
-        now = datetime.now(moscow)
-        next_run = now.replace(hour=3, minute=5, second=0, microsecond=0)
-        if now >= next_run:
-            next_run += timedelta(days=1)
-        await asyncio.sleep(max(30, (next_run - now).total_seconds()))
-        try:
-            await sync_huntme_interview_slots()
-        except Exception as exc:
-            logger.exception(f"Ошибка ежедневной синхронизации слотов CRM: {exc}")
-        try:
-            await notify_admins_if_no_interview_slots()
-        except Exception as exc:
-            logger.exception(f"Ошибка уведомления админов об отсутствии дат: {exc}")
 
 
 async def cleanup_slots_loop():
@@ -3067,6 +2564,19 @@ async def _init_db(db_url: str):
             ALTER TABLE applications
             ADD COLUMN IF NOT EXISTS admin_confirmed BOOLEAN DEFAULT NULL
         """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_interview_slots_free_dt
+            ON interview_slots (slot_dt) WHERE is_booked = FALSE
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_interview_slots_reminder
+            ON interview_slots (slot_dt)
+            WHERE is_booked = TRUE AND reminder_sent = FALSE
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_applications_user_type_submitted
+            ON applications (user_id, app_type, submitted_at DESC)
+        """)
     logger.info("Таблицы БД готовы")
 
 
@@ -3082,11 +2592,10 @@ async def _webhook_background_init(db_url: str):
         logger.info(f"Webhook установлен: {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Ошибка установки webhook: {e}")
-    await sync_huntme_interview_slots()
+    await notify_admins_if_no_interview_slots()
     await notify_admins_if_no_interview_slots()
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(cleanup_slots_loop())
-    asyncio.create_task(huntme_slots_sync_loop())
     asyncio.create_task(reminder_loop())
     logger.info("Фоновая инициализация завершена")
 
@@ -3118,7 +2627,6 @@ async def main():
         # Dev: обычный порядок с polling
         logger.info("Режим: Polling (dev)")
         await _init_db(db_url)
-        await sync_huntme_interview_slots()
         await notify_admins_if_no_interview_slots()
         webhook_info = await bot.get_webhook_info()
         if webhook_info.url:
