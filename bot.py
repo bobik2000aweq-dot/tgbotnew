@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import re
 from datetime import datetime, timedelta
 from aiohttp import web
 import aiohttp
@@ -24,6 +25,7 @@ def _get_ai_client():
         base_url=os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL") or None,
     )
 
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
@@ -31,11 +33,10 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
 
-# Huntme подключается только через секрет окружения. Ключ не хранится в исходном коде.
 HUNTME_API_KEY = os.environ.get("HUNTME_API_KEY")
-HUNTME_API_URL = os.environ.get(
-    "HUNTME_API_URL",
-    "https://api.huntme.in/v1/investigate",
+HUNTME_API_BASE_URL = os.environ.get(
+    "HUNTME_API_BASE_URL",
+    "https://apihmscout.com/api/employee-api-key",
 )
 ADMIN_IDS = [8123065501, 8288307098, 7387962932]
 DATABASE_URL = os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
@@ -478,6 +479,77 @@ def extract_form_field(app_text: str, *keywords) -> str | None:
                 if value and value not in ("-", "—", "нет", "."):
                     return value
     return None
+
+
+def _normalize_phone(value: str) -> str:
+    phone = re.sub(r"[^\d+]", "", value or "")
+    if phone.startswith("8") and len(phone) == 11:
+        phone = "+7" + phone[1:]
+    return phone
+
+
+def _normalize_telegram(value: str) -> str | None:
+    telegram = (value or "").strip()
+    telegram = re.sub(r"^https?://t\.me/", "", telegram, flags=re.IGNORECASE)
+    telegram = telegram.lstrip("@").split("/", 1)[0]
+    if re.fullmatch(r"[a-zA-Z0-9_]{5,}", telegram):
+        return telegram
+    return None
+
+
+async def _huntme_create_agent_request(app) -> tuple[int, object]:
+    if not HUNTME_API_KEY:
+        raise RuntimeError("HUNTME_API_KEY не задан в переменных окружения")
+
+    app_text = app["app_text"] or ""
+    name = extract_form_field(app_text, "имя") or app["full_name"] or ""
+    birth_date = extract_form_field(app_text, "дата рождения", "возраст")
+    phone_value = extract_form_field(app_text, "телефон", "номер телефона", "номер")
+    telegram_value = extract_form_field(app_text, "телеграм", "telegram")
+    telegram = _normalize_telegram(telegram_value)
+    if not telegram and app["username"] and app["username"] != "без username":
+        telegram = _normalize_telegram(app["username"])
+    number = _normalize_phone(phone_value or "")
+
+    missing = []
+    if len(name.strip()) < 3:
+        missing.append("имя")
+    if not birth_date:
+        missing.append("дата рождения")
+    if not number:
+        missing.append("номер телефона")
+    if missing:
+        raise ValueError("В анкете не хватает: " + ", ".join(missing))
+
+    payload = {
+        "category": 0,
+        "payment_system": 0,
+        "name": name.strip()[:255],
+        "birth_date": birth_date.strip(),
+        "number": number,
+    }
+    if telegram:
+        payload["telegram"] = telegram
+
+    headers = {
+        "Authorization": f"Bearer {HUNTME_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Idempotency-Key": f"telegram-scout-{app['id']}",
+    }
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            f"{HUNTME_API_BASE_URL.rstrip('/')}/request-call/agent",
+            headers=headers,
+            json=payload,
+        ) as response:
+            raw = await response.text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = raw
+            return response.status, data
 
 
 async def db_get_scout_referrals() -> dict:
@@ -1622,6 +1694,29 @@ async def callbacks(callback: types.CallbackQuery):
             except Exception:
                 pass
             return
+        try:
+            huntme_status, huntme_result = await _huntme_create_agent_request(app)
+        except ValueError as e:
+            logger.warning(f"Huntme не принял заявку #{app_id}: {e}")
+            await callback.answer(f"❌ {e}", show_alert=True)
+            return
+        except Exception as e:
+            logger.error(f"Ошибка отправки заявки #{app_id} в Huntme: {e}")
+            await callback.answer(
+                "❌ Не удалось отправить заявку в Huntme. Проверь HUNTME_API_KEY и логи Railway.",
+                show_alert=True,
+            )
+            return
+        if huntme_status not in (200, 201):
+            logger.error(
+                f"Huntme отклонил заявку #{app_id}: HTTP {huntme_status}; "
+                f"ответ={huntme_result}"
+            )
+            await callback.answer(
+                f"❌ Huntme отклонил заявку (HTTP {huntme_status}).",
+                show_alert=True,
+            )
+            return
         admin = callback.from_user
         admin_name = f"@{admin.username}" if admin.username else (admin.first_name or "Админ")
         user_message = (
@@ -1914,9 +2009,10 @@ async def callbacks(callback: types.CallbackQuery):
                     "Что напишешь?\n\n"
                     "▸ <b>Анкета — заполни всё одним сообщением:</b>\n\n"
                     "1. Имя:\n"
-                    "2. Возраст:\n"
+                    "2. Дата рождения (дд.мм.гггг):\n"
                     "3. Telegram:\n"
-                    "4. Ответ на задание:"
+                    "4. Номер телефона:\n"
+                    "5. Ответ на задание:"
                 )
             await callback.message.answer(form_text, reply_markup=cancel_keyboard())
         return
