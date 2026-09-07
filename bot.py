@@ -2,6 +2,8 @@ import asyncio
 import os
 import logging
 import re
+import json
+import uuid
 from datetime import datetime, timedelta
 from aiohttp import web
 import aiohttp
@@ -36,6 +38,10 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+HUNTME_API_KEY = os.environ.get("HUNTME_API_KEY")
+HUNTME_API_BASE_URL = os.environ.get("HUNTME_API_BASE_URL", "https://apihmscout.com/api/employee-api-key").rstrip("/")
+HUNTME_OPERATOR_OFFICE_ID = os.environ.get("HUNTME_OPERATOR_OFFICE_ID")
+HUNTME_TIMEOUT_SECONDS = int(os.environ.get("HUNTME_TIMEOUT_SECONDS", "20"))
 ADMIN_IDS = [8123065501, 8288307098, 7387962932]
 DATABASE_URL = os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
@@ -535,6 +541,96 @@ def extract_form_field(app_text: str, *keywords) -> str | None:
                 if value and value not in ("-", "—", "нет", "."):
                     return value
     return None
+
+
+def _normalize_phone(value: str) -> str:
+    phone = re.sub(r"[^\d+]", "", value or "")
+    if phone.startswith("8") and len(phone) == 11:
+        phone = "+7" + phone[1:]
+    return phone
+
+
+def _normalize_telegram(value: str) -> str | None:
+    telegram = (value or "").strip()
+    telegram = re.sub(r"^https?://t\.me/", "", telegram, flags=re.IGNORECASE)
+    telegram = telegram.lstrip("@").split("/", 1)[0]
+    if re.fullmatch(r"[a-zA-Z0-9_]{5,}", telegram):
+        return telegram
+    return None
+
+
+def _huntme_birth_date(app_text: str) -> str | None:
+    match = re.search(r"(?<!\d)(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4})(?!\d)", app_text)
+    if not match:
+        return None
+    raw = match.group(1).replace("/", ".").replace("-", ".")
+    try:
+        return datetime.strptime(raw, "%d.%m.%Y").strftime("%d.%m.%Y")
+    except ValueError:
+        return None
+
+
+async def _huntme_json_request(method: str, path: str, *, json_body=None, headers=None):
+    if not HUNTME_API_KEY:
+        return 0, {"message": "HUNTME_API_KEY не задан"}
+    request_headers = {"Authorization": f"Bearer {HUNTME_API_KEY}", "Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    timeout = aiohttp.ClientTimeout(total=HUNTME_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(method, f"{HUNTME_API_BASE_URL}/{path.lstrip('/')}", json=json_body, headers=request_headers) as response:
+            raw = await response.text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = raw
+            return response.status, payload
+
+
+async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int, object]:
+    office_id_value = slot["office_id"] if slot and "office_id" in slot.keys() else None
+    office_id_value = office_id_value or HUNTME_OPERATOR_OFFICE_ID
+    if not office_id_value:
+        return 0, {"message": "не задан HUNTME_OPERATOR_OFFICE_ID"}
+    try:
+        office_id = int(office_id_value)
+    except (TypeError, ValueError):
+        return 0, {"message": "HUNTME_OPERATOR_OFFICE_ID должен быть числом"}
+    app_text = app["app_text"] or ""
+    name = extract_form_field(app_text, "имя") or app["full_name"] or ""
+    birth_date = _huntme_birth_date(app_text)
+    phone_value = extract_form_field(app_text, "телефон", "номер телефона", "номер")
+    number = _normalize_phone(phone_value or "")
+    telegram = _normalize_telegram(extract_form_field(app_text, "телеграм", "telegram") or "")
+    slot_dt = slot["slot_dt"] if slot else None
+    missing = []
+    if len(name.strip()) < 3: missing.append("имя")
+    if not birth_date: missing.append("дата рождения в формате ДД.ММ.ГГГГ")
+    if not number or not (10 <= len(re.sub(r"\D", "", number)) <= 15): missing.append("номер телефона")
+    if missing: return 422, {"message": "В анкете не хватает: " + ", ".join(missing)}
+    if not slot_dt: return 422, {"message": "у локального слота нет даты"}
+    payload = {
+        "category": 0,
+        "office_id": office_id,
+        "interview_appointment_date": f"{slot_dt:%d.%m.%Y %H:%M}",
+        "name": name.strip()[:255],
+        "birth_date": birth_date,
+        "number": number,
+    }
+    if telegram: payload["telegram"] = telegram
+    headers = {"Content-Type": "application/json", "Idempotency-Key": str(uuid.uuid5(uuid.NAMESPACE_URL, f"hlustyak-operator:{app['id']}:{slot_id}"))}
+    return await _huntme_json_request("POST", "/request-call/operator", json_body=payload, headers=headers)
+
+
+async def _submit_operator_request_to_crm(app, slot_id: int, slot):
+    try:
+        status, payload = await _huntme_create_operator_request(app, slot_id, slot)
+        if status in (200, 201):
+            logger.info(f"Заявка #{app['id']} отправлена в CRM после бронирования слота #{slot_id}")
+        else:
+            logger.error(f"Не удалось отправить заявку #{app['id']} в CRM: HTTP {status}; ответ={payload}")
+    except Exception as exc:
+        logger.exception(f"Ошибка фоновой отправки заявки #{app['id']} в CRM: {exc}")
 
 
 async def db_get_scout_referrals() -> dict:
@@ -1294,6 +1390,8 @@ async def callbacks(callback: types.CallbackQuery):
                 pass
             return
         slot_text = slot_record["slot_text"]
+        # CRM отправка не блокирует подтверждение пользователю.
+        asyncio.create_task(_submit_operator_request_to_crm(_bk_check, slot_id, slot_record))
         if not is_admin(_cb_user):
             await db_set_cooldown(user_id, "operator")
         try:
@@ -2592,7 +2690,6 @@ async def _webhook_background_init(db_url: str):
         logger.info(f"Webhook установлен: {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Ошибка установки webhook: {e}")
-    await notify_admins_if_no_interview_slots()
     await notify_admins_if_no_interview_slots()
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(cleanup_slots_loop())
