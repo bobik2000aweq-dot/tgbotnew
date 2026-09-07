@@ -1090,13 +1090,25 @@ async def show_admin_date_slots(message, date_str: str):
 
 
 async def show_admin_interviews(target):
+    if HUNTME_API_KEY and HUNTME_OPERATOR_OFFICE_ID:
+        try:
+            await sync_huntme_interview_slots()
+        except Exception as exc:
+            logger.exception(f"Ошибка загрузки слотов CRM в админском меню: {exc}")
     dates = await db_get_slot_dates_summary()
+    crm_mode = bool(HUNTME_API_KEY and HUNTME_OPERATOR_OFFICE_ID)
     sep = "─" * 22
     if not dates:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить даты", callback_data="interview_add")],
-        ])
-        text = f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\nСлотов пока нет.\nДобавьте даты, чтобы операторы могли записаться."
+        if crm_mode:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить из CRM", callback_data="admin_interviews_back")],
+            ])
+            text = f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\nCRM пока не вернула свободные слоты.\nРучная загрузка не требуется — нажмите обновить после появления слотов в CRM."
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить даты", callback_data="interview_add")],
+            ])
+            text = f"📅 <b>СОБЕСЕДОВАНИЯ</b>\n{sep}\n\nСлотов пока нет.\nДобавьте даты, чтобы операторы могли записаться."
     else:
         total_free = sum(v["free"] for v in dates.values())
         total_booked = sum(v["booked"] for v in dates.values())
@@ -1106,7 +1118,10 @@ async def show_admin_interviews(target):
             booked_part = f"  ✅ {counts['booked']} зап." if counts["booked"] else ""
             label = f"📅 {date_part}{free_part}{booked_part}"
             rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_idate:{date_part}")])
-        rows.append([InlineKeyboardButton(text="➕ Добавить даты", callback_data="interview_add")])
+        if crm_mode:
+            rows.append([InlineKeyboardButton(text="🔄 Обновить из CRM", callback_data="admin_interviews_back")])
+        else:
+            rows.append([InlineKeyboardButton(text="➕ Добавить даты", callback_data="interview_add")])
         rows.append([InlineKeyboardButton(text="🗑 Очистить все слоты", callback_data="interview_clear")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
         text = (
