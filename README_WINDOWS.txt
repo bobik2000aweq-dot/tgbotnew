@@ -33,7 +33,7 @@ Example for the current Windows terminal:
   dist\hlustyak_bot.exe
 
 
-When an operator selects an interview slot, the bot checks it against the CRM and sends it to POST /request-call/operator. The local application is saved first, so a CRM outage does not lose it. An administrator can use /huntme_offices to list accessible office IDs.
+Only operator applications are synchronized with CRM: when an operator selects an interview slot, the bot checks it against the CRM and sends it to POST /request-call/operator. Scout applications stay inside the bot and are not sent to CRM. The local application is saved first, so a CRM outage does not lose it. An administrator can use /huntme_offices to list accessible office IDs.
 
 The image is bundled into the executable by PyInstaller, so welcome.png is
 needed only while building and does not need to be distributed with the EXE.
