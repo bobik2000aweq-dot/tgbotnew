@@ -2524,27 +2524,61 @@ async def sync_huntme_interview_slots() -> int:
         logger.error(f"CRM вернула ответ без data: {payload}")
         return 0
 
-    # Поддерживаем форматы CRM: словарь дата -> времена и список объектов.
+    # Поддерживаем форматы CRM: дата -> времена, список слотов и ISO-строки.
     schedule_items = []
+
+    def add_schedule_item(date_value, times_value):
+        if date_value and times_value:
+            if isinstance(times_value, (list, tuple)):
+                schedule_items.append((date_value, list(times_value)))
+            else:
+                schedule_items.append((date_value, [times_value]))
+
+    def add_combined_slot(value):
+        value = str(value)
+        date_match = re.search(
+            r"(\d{4}-\d{2}-\d{2}|\d{1,2}[.]\d{1,2}(?:[.]\d{4})?|\d{1,2}/\d{1,2}(?:/\d{4})?)",
+            value,
+        )
+        time_match = re.search(r"(\d{1,2}:\d{2})", value)
+        if date_match and time_match:
+            add_schedule_item(date_match.group(1), [time_match.group(1)])
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if data is None:
+        logger.error(f"CRM вернула ответ без data: {payload}")
+        return 0
     if isinstance(data, dict):
         if isinstance(data.get("slots"), list):
             for item in data["slots"]:
                 if isinstance(item, dict):
-                    schedule_items.append((
-                        item.get("date") or item.get("day") or item.get("interview_date"),
-                        [item.get("time") or item.get("start_time") or item.get("start")],
-                    ))
+                    date_value = item.get("date") or item.get("day") or item.get("interview_date")
+                    times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
+                    if date_value and times_value:
+                        add_schedule_item(date_value, times_value)
+                    else:
+                        add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
+                else:
+                    add_combined_slot(item)
         else:
-            schedule_items = list(data.items())
+            for date_value, times_value in data.items():
+                if date_value in {"office_id", "funnel", "timezone", "slots"}:
+                    continue
+                add_schedule_item(date_value, times_value)
     elif isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
-                schedule_items.append((
-                    item.get("date") or item.get("day") or item.get("interview_date"),
-                    [item.get("time") or item.get("start_time") or item.get("start")],
-                ))
+                date_value = item.get("date") or item.get("day") or item.get("interview_date")
+                times_value = item.get("times") or item.get("available_times") or item.get("time") or item.get("start_time") or item.get("start")
+                if date_value and times_value:
+                    add_schedule_item(date_value, times_value)
+                else:
+                    add_combined_slot(item.get("datetime") or item.get("slot") or item.get("value") or "")
+            else:
+                add_combined_slot(item)
     if not schedule_items:
-        logger.warning(f"CRM не вернула свободных слотов: {payload}")
+        logger.warning(f"CRM не вернула распознаваемых свободных слотов: {payload}")
+        return 0
 
     moscow = ZoneInfo("Europe/Moscow")
     now = datetime.now(moscow).replace(tzinfo=None, second=0, microsecond=0)
