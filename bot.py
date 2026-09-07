@@ -327,15 +327,36 @@ async def db_add_interview_slots(slots: list):
 async def db_get_free_slots():
     async with db_pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, slot_text FROM interview_slots WHERE is_booked=FALSE ORDER BY slot_dt ASC"
+            """
+            SELECT DISTINCT ON (slot_dt) id, slot_text, slot_dt
+            FROM interview_slots s
+            WHERE s.is_booked = FALSE
+              AND s.slot_dt IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM interview_slots booked
+                  WHERE booked.slot_dt = s.slot_dt AND booked.is_booked = TRUE
+              )
+            ORDER BY slot_dt ASC, id ASC
+            """
         )
 
 
 async def db_get_free_slots_for_date(date_str: str):
     async with db_pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, slot_text FROM interview_slots WHERE is_booked=FALSE AND slot_text LIKE $1 ORDER BY slot_dt ASC",
-            f"{date_str}%"
+            """
+            SELECT DISTINCT ON (slot_dt) id, slot_text, slot_dt
+            FROM interview_slots s
+            WHERE s.is_booked = FALSE
+              AND s.slot_dt IS NOT NULL
+              AND TO_CHAR(s.slot_dt, 'DD.MM') = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM interview_slots booked
+                  WHERE booked.slot_dt = s.slot_dt AND booked.is_booked = TRUE
+              )
+            ORDER BY slot_dt ASC, id ASC
+            """,
+            date_str,
         )
 
 
@@ -349,12 +370,32 @@ async def db_get_booked_slot_for_app(app_id: int):
 
 
 async def db_book_slot(slot_id: int, user_id: int, app_id: int) -> bool:
+    """Бронирует время атомарно, не позволяя занять его дважды."""
     async with db_pool.acquire() as conn:
-        result = await conn.execute(
-            "UPDATE interview_slots SET is_booked=TRUE, booked_by_user_id=$2, booked_app_id=$3 WHERE id=$1 AND is_booked=FALSE",
-            slot_id, user_id, app_id
-        )
-    return result == "UPDATE 1"
+        async with conn.transaction():
+            slot_dt = await conn.fetchval(
+                "SELECT slot_dt FROM interview_slots WHERE id=$1 FOR UPDATE",
+                slot_id,
+            )
+            if not slot_dt:
+                return False
+            # Блокируем все строки того же времени: это защищает от дублей по офисам
+            # и от двух одновременных нажатий на одну дату.
+            await conn.fetch(
+                "SELECT id FROM interview_slots WHERE slot_dt=$1 FOR UPDATE",
+                slot_dt,
+            )
+            already_booked = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM interview_slots WHERE slot_dt=$1 AND is_booked=TRUE)",
+                slot_dt,
+            )
+            if already_booked:
+                return False
+            result = await conn.execute(
+                "UPDATE interview_slots SET is_booked=TRUE, booked_by_user_id=$2, booked_app_id=$3 WHERE id=$1 AND is_booked=FALSE",
+                slot_id, user_id, app_id,
+            )
+            return result == "UPDATE 1"
 
 
 async def db_release_slot(slot_id: int):
@@ -556,41 +597,50 @@ async def _huntme_json_request(method: str, path: str, *, params=None, json_body
             return response.status, payload
 
 def _huntme_slot_is_available(payload_data, target_dt: datetime) -> bool:
-    if isinstance(payload_data, dict):
-        entries = list(payload_data.items())
-    elif isinstance(payload_data, list):
-        entries = [(item.get("date") or item.get("day") or item.get("interview_date"), item) for item in payload_data if isinstance(item, dict)]
-    else:
-        return False
+    """Проверяет слот в разных форматах ответа CRM, включая data.slots."""
     target_date = target_dt.date()
     target_time = target_dt.strftime("%H:%M")
-    for date_value, raw_times in entries:
-        date_text = str(date_value or "").strip()
-        parsed_date = None
-        for date_format in ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m"):
+    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m")
+
+    def parse_date(value):
+        text = str(value or "").strip()
+        for date_format in date_formats:
             try:
-                parsed_date = datetime.strptime(date_text[:10], date_format).date()
+                parsed = datetime.strptime(text[:10], date_format).date()
                 if date_format == "%d.%m":
-                    parsed_date = parsed_date.replace(year=target_date.year)
-                break
+                    parsed = parsed.replace(year=target_date.year)
+                return parsed
             except ValueError:
                 continue
-        if parsed_date != target_date:
-            continue
-        if isinstance(raw_times, dict):
-            time_items = raw_times.get("times") or raw_times.get("available_times") or list(raw_times.keys())
-        elif isinstance(raw_times, list):
-            time_items = raw_times
-        else:
-            time_items = [raw_times]
-        for raw_time in time_items:
-            if isinstance(raw_time, dict):
-                raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
-            match = re.search(r"(\d{1,2}:\d{2})", str(raw_time or ""))
-            if match and match.group(1) == target_time:
-                return True
-    return False
+        return None
 
+    def time_matches(value):
+        if isinstance(value, dict):
+            return any(time_matches(child) for child in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(time_matches(child) for child in value)
+        match = re.search(r"(\d{1,2}:\d{2})", str(value or ""))
+        return bool(match and match.group(1) == target_time)
+
+    def walk(value):
+        if isinstance(value, dict):
+            date_value = value.get("date") or value.get("day") or value.get("interview_date")
+            times_value = value.get("times") or value.get("available_times") or value.get("time") or value.get("start_time") or value.get("start")
+            if date_value and parse_date(date_value) == target_date and time_matches(times_value):
+                return True
+            for key, child in value.items():
+                if parse_date(key) == target_date and time_matches(child):
+                    return True
+                if walk(child):
+                    return True
+            return False
+        if isinstance(value, (list, tuple)):
+            return any(walk(child) for child in value)
+        text = str(value or "")
+        date_match = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[.]\d{1,2}(?:[.]\d{4})?|\d{1,2}/\d{1,2}(?:/\d{4})?)", text)
+        return bool(date_match and parse_date(date_match.group(1)) == target_date and time_matches(text))
+
+    return walk(payload_data)
 
 async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int, object]:
     office_id_value = None
@@ -2780,8 +2830,10 @@ async def sync_huntme_interview_slots() -> int:
                 except ValueError:
                     continue
                 if now <= slot_dt < horizon:
-                    slot_key = (slot_dt, office["id"])
-                    desired[slot_key] = f"{slot_dt:%d.%m %H:%M} — {office['label']}"
+                    desired.setdefault(
+                        slot_dt,
+                        (office["id"], f"{slot_dt:%d.%m %H:%M} — {office['label']}")
+                    )
 
     if not desired:
         logger.warning("CRM не вернула распознаваемых свободных слотов ни для одного офиса")
@@ -2793,15 +2845,22 @@ async def sync_huntme_interview_slots() -> int:
             SELECT id, slot_text, slot_dt, is_booked, office_id, source
             FROM interview_slots
             WHERE slot_dt >= $1 AND slot_dt < $2
+            ORDER BY slot_dt ASC, is_booked DESC, id ASC
             """,
             now,
             horizon,
         )
-        existing_by_key = {(row["slot_dt"], row["office_id"]): row for row in existing}
+        existing_by_dt = {}
+        for row in existing:
+            current = existing_by_dt.get(row["slot_dt"])
+            if current is None or (row["is_booked"] and not current["is_booked"]):
+                existing_by_dt[row["slot_dt"]] = row
+
         added = 0
-        updated = 0
-        for (slot_dt, office_id), slot_text in desired.items():
-            row = existing_by_key.get((slot_dt, office_id))
+        updated_count = 0
+        for slot_dt, slot_data in desired.items():
+            office_id, slot_text = slot_data
+            row = existing_by_dt.get(slot_dt)
             if row is None:
                 await conn.execute(
                     "INSERT INTO interview_slots (slot_text, slot_dt, office_id, source) VALUES ($1, $2, $3, 'crm')",
@@ -2810,14 +2869,25 @@ async def sync_huntme_interview_slots() -> int:
                     office_id,
                 )
                 added += 1
-            elif not row["is_booked"] and row["source"] == "crm" and row["slot_text"] != slot_text:
-                await conn.execute("UPDATE interview_slots SET slot_text=$1 WHERE id=$2", slot_text, row["id"])
-                updated += 1
+            elif not row["is_booked"] and row["source"] == "crm":
+                if row["slot_text"] != slot_text or row["office_id"] != office_id:
+                    await conn.execute(
+                        "UPDATE interview_slots SET slot_text=$1, office_id=$2 WHERE id=$3",
+                        slot_text,
+                        office_id,
+                        row["id"],
+                    )
+                    updated_count += 1
+
         removed = 0
-        desired_keys = set(desired)
+        desired_dates = set(desired)
+        winner_ids = {row["id"] for row in existing_by_dt.values()}
         for row in existing:
-            row_key = (row["slot_dt"], row["office_id"])
-            if not row["is_booked"] and row["source"] == "crm" and row_key not in desired_keys:
+            if (
+                not row["is_booked"]
+                and row["source"] == "crm"
+                and (row["slot_dt"] not in desired_dates or row["id"] not in winner_ids)
+            ):
                 await conn.execute("DELETE FROM interview_slots WHERE id=$1", row["id"])
                 removed += 1
 
