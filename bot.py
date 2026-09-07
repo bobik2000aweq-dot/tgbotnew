@@ -17,6 +17,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 import asyncpg
 import sys
 import json
+import uuid
 from openai import AsyncOpenAI
 
 def _get_ai_client():
@@ -37,7 +38,9 @@ HUNTME_API_KEY = os.environ.get("HUNTME_API_KEY")
 HUNTME_API_BASE_URL = os.environ.get(
     "HUNTME_API_BASE_URL",
     "https://apihmscout.com/api/employee-api-key",
-)
+).rstrip("/")
+HUNTME_OPERATOR_OFFICE_ID = os.environ.get("HUNTME_OPERATOR_OFFICE_ID")
+HUNTME_TIMEOUT_SECONDS = int(os.environ.get("HUNTME_TIMEOUT_SECONDS", "20"))
 ADMIN_IDS = [8123065501, 8288307098, 7387962932]
 DATABASE_URL = os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
@@ -362,6 +365,14 @@ async def db_get_slot_text(slot_id: int) -> str | None:
         return row["slot_text"] if row else None
 
 
+async def db_get_slot_by_id(slot_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, slot_text, slot_dt FROM interview_slots WHERE id=$1",
+            slot_id,
+        )
+
+
 async def db_get_slot_by_app_id(app_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
@@ -495,6 +506,105 @@ def _normalize_telegram(value: str) -> str | None:
     if re.fullmatch(r"[a-zA-Z0-9_]{5,}", telegram):
         return telegram
     return None
+
+
+def _huntme_birth_date(app_text: str) -> str | None:
+    match = re.search(r"(?<!\d)(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4})(?!\d)", app_text)
+    if not match:
+        return None
+    raw = match.group(1).replace("/", ".").replace("-", ".")
+    try:
+        return datetime.strptime(raw, "%d.%m.%Y").strftime("%d.%m.%Y")
+    except ValueError:
+        return None
+
+
+async def _huntme_json_request(method: str, path: str, *, params=None, json_body=None, headers=None):
+    if not HUNTME_API_KEY:
+        return 0, {"message": "HUNTME_API_KEY не задан"}
+    request_headers = {
+        "Authorization": f"Bearer {HUNTME_API_KEY}",
+        "Accept": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+    timeout = aiohttp.ClientTimeout(total=HUNTME_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(
+            method,
+            f"{HUNTME_API_BASE_URL}/{path.lstrip('/')}",
+            params=params,
+            json=json_body,
+            headers=request_headers,
+        ) as response:
+            raw = await response.text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = raw
+            return response.status, payload
+
+
+async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int, object]:
+    if not HUNTME_OPERATOR_OFFICE_ID:
+        return 0, {"message": "HUNTME_OPERATOR_OFFICE_ID не задан"}
+    try:
+        office_id = int(HUNTME_OPERATOR_OFFICE_ID)
+    except ValueError:
+        return 0, {"message": "HUNTME_OPERATOR_OFFICE_ID должен быть числом"}
+
+    app_text = app["app_text"] or ""
+    name = extract_form_field(app_text, "имя") or app["full_name"] or ""
+    birth_date = _huntme_birth_date(app_text)
+    phone_value = extract_form_field(app_text, "телефон", "номер телефона", "номер")
+    number = _normalize_phone(phone_value or "")
+    telegram = _normalize_telegram(extract_form_field(app_text, "телеграм", "telegram") or "")
+    slot_dt = slot["slot_dt"] if slot else None
+    missing = []
+    if len(name.strip()) < 3:
+        missing.append("имя")
+    if not birth_date:
+        missing.append("дата рождения в формате ДД.ММ.ГГГГ")
+    if not number or not (10 <= len(re.sub(r"\D", "", number)) <= 15):
+        missing.append("номер телефона")
+    if missing:
+        return 422, {"message": "В анкете не хватает: " + ", ".join(missing)}
+    if not slot_dt:
+        return 422, {"message": "у локального слота нет даты"}
+
+    target_date = slot_dt.strftime("%d.%m.%Y")
+    target_time = slot_dt.strftime("%H:%M")
+    slots_status, slots_payload = await _huntme_json_request(
+        "GET",
+        "/interview-slots",
+        params={"office_id": office_id, "funnel": "operators"},
+    )
+    slots_data = slots_payload.get("data") if isinstance(slots_payload, dict) else None
+    if slots_status != 200:
+        return slots_status, {"message": "не удалось проверить слот в CRM", "details": slots_payload}
+    if not isinstance(slots_data, dict) or target_time not in (slots_data.get(target_date) or []):
+        return 422, {"message": "выбранного времени уже нет среди свободных слотов CRM"}
+
+    payload = {
+        "category": 0,
+        "office_id": office_id,
+        "interview_appointment_date": f"{target_date} {target_time}",
+        "name": name.strip()[:255],
+        "birth_date": birth_date,
+        "number": number,
+    }
+    if telegram:
+        payload["telegram"] = telegram
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": str(uuid.uuid5(uuid.NAMESPACE_URL, f"hlustyak-operator:{app['id']}:{slot_id}")),
+    }
+    return await _huntme_json_request(
+        "POST",
+        "/request-call/operator",
+        json_body=payload,
+        headers=headers,
+    )
 
 
 async def _huntme_create_agent_request(app) -> tuple[int, object]:
@@ -1078,6 +1188,31 @@ async def applications_cmd(message: types.Message):
     )
 
 
+@dp.message(Command("huntme_offices"))
+async def huntme_offices_cmd(message: types.Message):
+    if not is_admin(message.from_user):
+        return
+    status, payload = await _huntme_json_request(
+        "GET", "/offices", params={"funnel": "operators"}
+    )
+    if status != 200:
+        reason = payload.get("message", "ошибка API") if isinstance(payload, dict) else str(payload)
+        await message.answer(f"⚠️ Не удалось получить офисы CRM: {reason}")
+        return
+    offices = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(offices, list) or not offices:
+        await message.answer("📭 Для воронки операторов доступных офисов нет.")
+        return
+    lines = ["🏢 <b>Офисы CRM для операторов</b>\n"]
+    for office in offices:
+        lines.append(
+            f"• <code>{office.get('office_id')}</code> — "
+            f"{office.get('name') or 'Без названия'} ({office.get('city') or 'город не указан'})"
+        )
+    lines.append("\nУкажи нужный ID в HUNTME_OPERATOR_OFFICE_ID.")
+    await message.answer("\n".join(lines))
+
+
 @dp.callback_query()
 async def callbacks(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -1284,14 +1419,32 @@ async def callbacks(callback: types.CallbackQuery):
             except Exception:
                 pass
             return
-        await db_book_slot(slot_id, user_id, app_id)
-        slot_text = await db_get_slot_text(slot_id)
-        if not slot_text:
+        slot_record = await db_get_slot_by_id(slot_id)
+        if not slot_record:
             try:
                 await callback.answer("Ошибка при записи, попробуйте ещё раз.", show_alert=True)
             except Exception:
                 pass
             return
+        await db_book_slot(slot_id, user_id, app_id)
+        slot_text = slot_record["slot_text"]
+        crm_line = ""
+        if HUNTME_API_KEY:
+            try:
+                huntme_status, huntme_result = await _huntme_create_operator_request(
+                    _bk_check, slot_id, slot_record
+                )
+                if huntme_status in (200, 201):
+                    crm_data = huntme_result.get("data", huntme_result) if isinstance(huntme_result, dict) else {}
+                    crm_id = crm_data.get("uniqid") if isinstance(crm_data, dict) else None
+                    crm_line = f"\n🏢 <b>CRM:</b> заявка <code>{crm_id or 'создана'}</code>"
+                else:
+                    reason = huntme_result.get("message", "ошибка API") if isinstance(huntme_result, dict) else str(huntme_result)
+                    crm_line = f"\n⚠️ <b>CRM:</b> не синхронизировано — {reason}"
+                    logger.error(f"Huntme operator sync failed for application #{app_id}: HTTP {huntme_status}; response={huntme_result}")
+            except Exception as exc:
+                crm_line = "\n⚠️ <b>CRM:</b> ошибка синхронизации, заявка сохранена локально"
+                logger.exception(f"Huntme operator sync error for application #{app_id}: {exc}")
         try:
             await callback.answer(f"✅ Записан на {slot_text}", show_alert=True)
         except Exception:
@@ -1341,7 +1494,7 @@ async def callbacks(callback: types.CallbackQuery):
                     f"🔗 {username_str}  ·  🆔 <code>{user_id}</code>\n"
                     f"\n\n👁 @werolk @whyisrey"
                 )
-        full_admin_msg = base_msg + f"\n{sep}\n📅 <b>Собеседование: {slot_text}</b>"
+        full_admin_msg = base_msg + f"\n{sep}\n📅 <b>Собеседование: {slot_text}</b>" + crm_line
         for admin_id in ADMIN_IDS:
             await safe_send(admin_id, full_admin_msg, reply_markup=admin_notify_keyboard("operator", app_id))
         return
