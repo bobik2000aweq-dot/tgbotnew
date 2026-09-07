@@ -554,6 +554,42 @@ async def _huntme_json_request(method: str, path: str, *, params=None, json_body
                 payload = raw
             return response.status, payload
 
+def _huntme_slot_is_available(payload_data, target_dt: datetime) -> bool:
+    if isinstance(payload_data, dict):
+        entries = list(payload_data.items())
+    elif isinstance(payload_data, list):
+        entries = [(item.get("date") or item.get("day") or item.get("interview_date"), item) for item in payload_data if isinstance(item, dict)]
+    else:
+        return False
+    target_date = target_dt.date()
+    target_time = target_dt.strftime("%H:%M")
+    for date_value, raw_times in entries:
+        date_text = str(date_value or "").strip()
+        parsed_date = None
+        for date_format in ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m"):
+            try:
+                parsed_date = datetime.strptime(date_text[:10], date_format).date()
+                if date_format == "%d.%m":
+                    parsed_date = parsed_date.replace(year=target_date.year)
+                break
+            except ValueError:
+                continue
+        if parsed_date != target_date:
+            continue
+        if isinstance(raw_times, dict):
+            time_items = raw_times.get("times") or raw_times.get("available_times") or list(raw_times.keys())
+        elif isinstance(raw_times, list):
+            time_items = raw_times
+        else:
+            time_items = [raw_times]
+        for raw_time in time_items:
+            if isinstance(raw_time, dict):
+                raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
+            match = re.search(r"(\d{1,2}:\d{2})", str(raw_time or ""))
+            if match and match.group(1) == target_time:
+                return True
+    return False
+
 
 async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int, object]:
     if not HUNTME_OPERATOR_OFFICE_ID:
@@ -592,7 +628,7 @@ async def _huntme_create_operator_request(app, slot_id: int, slot) -> tuple[int,
     slots_data = slots_payload.get("data") if isinstance(slots_payload, dict) else None
     if slots_status != 200:
         return slots_status, {"message": "не удалось проверить слот в CRM", "details": slots_payload}
-    if not isinstance(slots_data, dict) or target_time not in (slots_data.get(target_date) or []):
+    if not _huntme_slot_is_available(slots_data, slot_dt):
         return 422, {"message": "выбранного времени уже нет среди свободных слотов CRM"}
 
     payload = {
