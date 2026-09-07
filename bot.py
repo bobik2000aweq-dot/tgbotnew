@@ -1320,7 +1320,11 @@ async def callbacks(callback: types.CallbackQuery):
             except Exception:
                 pass
             return
-        dates = await db_get_free_slot_dates_summary()
+        try:
+            await sync_huntme_interview_slots()
+        except Exception as exc:
+            logger.exception(f"Ошибка загрузки слотов CRM при открытии собеседования: {exc}")
+                dates = await db_get_free_slot_dates_summary()
         if not dates:
             try:
                 await callback.answer("Слотов для записи пока нет. Попробуйте позже.", show_alert=True)
@@ -1332,8 +1336,7 @@ async def callbacks(callback: types.CallbackQuery):
         except Exception:
             pass
         rows = []
-        for date_part, counts in sorted(dates.items()):
-            total = counts["free"] + counts["booked"]
+        for date_part, total in sorted(dates.items()):
             rows.append([InlineKeyboardButton(
                 text=f"📅 {date_part} — {total} вар." if total > 1 else f"📅 {date_part}",
                 callback_data=f"idate:{date_part}:{app_id}"
@@ -1349,7 +1352,11 @@ async def callbacks(callback: types.CallbackQuery):
         parts = callback.data.split(":")
         date_str = parts[1]
         app_id = int(parts[2])
-        all_slots = await db_get_free_slots_for_date(date_str)
+        try:
+            await sync_huntme_interview_slots()
+        except Exception as exc:
+            logger.exception(f"Ошибка обновления слотов CRM при выборе даты: {exc}")
+                all_slots = await db_get_free_slots_for_date(date_str)
         if not all_slots:
             try:
                 await callback.answer("На эту дату слотов нет.", show_alert=True)
@@ -2513,20 +2520,47 @@ async def sync_huntme_interview_slots() -> int:
         logger.error(f"Не удалось получить слоты CRM: HTTP {status}; ответ={payload}")
         return 0
     data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        logger.error(f"CRM вернула неожиданный формат слотов: {payload}")
+    if data is None:
+        logger.error(f"CRM вернула ответ без data: {payload}")
         return 0
+
+    # Поддерживаем форматы CRM: словарь дата -> времена и список объектов.
+    schedule_items = []
+    if isinstance(data, dict):
+        if isinstance(data.get("slots"), list):
+            for item in data["slots"]:
+                if isinstance(item, dict):
+                    schedule_items.append((
+                        item.get("date") or item.get("day") or item.get("interview_date"),
+                        [item.get("time") or item.get("start_time") or item.get("start")],
+                    ))
+        else:
+            schedule_items = list(data.items())
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                schedule_items.append((
+                    item.get("date") or item.get("day") or item.get("interview_date"),
+                    [item.get("time") or item.get("start_time") or item.get("start")],
+                ))
+    if not schedule_items:
+        logger.warning(f"CRM не вернула свободных слотов: {payload}")
 
     moscow = ZoneInfo("Europe/Moscow")
     now = datetime.now(moscow).replace(tzinfo=None, second=0, microsecond=0)
     horizon = now + timedelta(days=7)
     desired = {}
-    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d")
-    for date_key, raw_times in data.items():
+    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d.%m")
+    for date_key, raw_times in schedule_items:
+        if not date_key:
+            continue
+        date_value = str(date_key).strip()[:10]
         parsed_date = None
         for date_format in date_formats:
             try:
-                parsed_date = datetime.strptime(str(date_key)[:10], date_format).date()
+                parsed_date = datetime.strptime(date_value, date_format).date()
+                if date_format == "%d.%m":
+                    parsed_date = parsed_date.replace(year=now.year)
                 break
             except ValueError:
                 continue
@@ -2537,7 +2571,7 @@ async def sync_huntme_interview_slots() -> int:
         elif isinstance(raw_times, list):
             time_items = raw_times
         else:
-            continue
+            time_items = [raw_times]
         for raw_time in time_items:
             if isinstance(raw_time, dict):
                 raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
@@ -2547,10 +2581,7 @@ async def sync_huntme_interview_slots() -> int:
             if not time_match:
                 continue
             try:
-                slot_dt = datetime.combine(
-                    parsed_date,
-                    datetime.strptime(time_match.group(0), "%H:%M").time(),
-                )
+                slot_dt = datetime.combine(parsed_date, datetime.strptime(time_match.group(0), "%H:%M").time())
             except ValueError:
                 continue
             if now <= slot_dt < horizon:
