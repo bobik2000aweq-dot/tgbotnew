@@ -3,6 +3,7 @@ import os
 import logging
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from aiohttp import web
 import aiohttp
 from aiogram import Bot, Dispatcher, types
@@ -2452,6 +2453,116 @@ async def health_handler(request):
     )
 
 
+async def sync_huntme_interview_slots() -> int:
+    """Синхронизирует свободные слоты CRM в локальное меню бота."""
+    if not HUNTME_API_KEY or not HUNTME_OPERATOR_OFFICE_ID:
+        logger.warning("Синхронизация слотов CRM пропущена: нет HUNTME_API_KEY или HUNTME_OPERATOR_OFFICE_ID")
+        return 0
+    try:
+        office_id = int(HUNTME_OPERATOR_OFFICE_ID)
+    except ValueError:
+        logger.error("HUNTME_OPERATOR_OFFICE_ID должен быть числом")
+        return 0
+
+    status, payload = await _huntme_json_request(
+        "GET",
+        "/interview-slots",
+        params={"office_id": office_id, "funnel": "operators"},
+    )
+    if status != 200:
+        logger.error(f"Не удалось получить слоты CRM: HTTP {status}; ответ={payload}")
+        return 0
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        logger.error(f"CRM вернула неожиданный формат слотов: {payload}")
+        return 0
+
+    moscow = ZoneInfo("Europe/Moscow")
+    now = datetime.now(moscow).replace(tzinfo=None, second=0, microsecond=0)
+    horizon = now + timedelta(days=7)
+    desired = {}
+    date_formats = ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d")
+    for date_key, raw_times in data.items():
+        parsed_date = None
+        for date_format in date_formats:
+            try:
+                parsed_date = datetime.strptime(str(date_key)[:10], date_format).date()
+                break
+            except ValueError:
+                continue
+        if not parsed_date:
+            continue
+        if isinstance(raw_times, dict):
+            time_items = list(raw_times.keys())
+        elif isinstance(raw_times, list):
+            time_items = raw_times
+        else:
+            continue
+        for raw_time in time_items:
+            if isinstance(raw_time, dict):
+                raw_time = raw_time.get("time") or raw_time.get("start_time") or raw_time.get("start")
+            if not raw_time:
+                continue
+            time_match = re.search(r"(\d{1,2}):(\d{2})", str(raw_time))
+            if not time_match:
+                continue
+            try:
+                slot_dt = datetime.combine(
+                    parsed_date,
+                    datetime.strptime(time_match.group(0), "%H:%M").time(),
+                )
+            except ValueError:
+                continue
+            if now <= slot_dt < horizon:
+                desired[slot_dt] = f"{slot_dt:%d.%m %H:%M}"
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetch(
+            """
+            SELECT id, slot_text, slot_dt, is_booked
+            FROM interview_slots
+            WHERE slot_dt >= $1 AND slot_dt < $2
+            """,
+            now,
+            horizon,
+        )
+        existing_by_dt = {row["slot_dt"]: row for row in existing if row["slot_dt"]}
+        added = 0
+        for slot_dt, slot_text in desired.items():
+            if slot_dt not in existing_by_dt:
+                await conn.execute(
+                    "INSERT INTO interview_slots (slot_text, slot_dt) VALUES ($1, $2)",
+                    slot_text,
+                    slot_dt,
+                )
+                added += 1
+        removed = 0
+        for row in existing:
+            if not row["is_booked"] and row["slot_dt"] not in desired:
+                await conn.execute("DELETE FROM interview_slots WHERE id=$1", row["id"])
+                removed += 1
+
+    logger.info(
+        f"Слоты CRM синхронизированы: доступно {len(desired)}, добавлено {added}, удалено устаревших {removed}"
+    )
+    return len(desired)
+
+
+async def huntme_slots_sync_loop():
+    """Обновляет меню собеседований каждый день в 03:05 по Москве."""
+    moscow = ZoneInfo("Europe/Moscow")
+    while True:
+        now = datetime.now(moscow)
+        next_run = now.replace(hour=3, minute=5, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        await asyncio.sleep(max(30, (next_run - now).total_seconds()))
+        try:
+            await sync_huntme_interview_slots()
+        except Exception as exc:
+            logger.exception(f"Ошибка ежедневной синхронизации слотов CRM: {exc}")
+
+
 async def cleanup_slots_loop():
     from datetime import timezone, timedelta as _td
     MSK = timezone(_td(hours=3))
@@ -2617,8 +2728,10 @@ async def _webhook_background_init(db_url: str):
         logger.info(f"Webhook установлен: {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Ошибка установки webhook: {e}")
+    await sync_huntme_interview_slots()
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(cleanup_slots_loop())
+    asyncio.create_task(huntme_slots_sync_loop())
     asyncio.create_task(reminder_loop())
     logger.info("Фоновая инициализация завершена")
 
@@ -2650,6 +2763,7 @@ async def main():
         # Dev: обычный порядок с polling
         logger.info("Режим: Polling (dev)")
         await _init_db(db_url)
+        await sync_huntme_interview_slots()
         webhook_info = await bot.get_webhook_info()
         if webhook_info.url:
             dev_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
