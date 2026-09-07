@@ -126,11 +126,6 @@ def validate_operator_form(text: str) -> list[str]:
         if not found:
             missing.append(label)
 
-    if missing:
-        non_empty = [l.strip() for l in text.splitlines() if l.strip()]
-        if len(non_empty) >= len(OPERATOR_FIELDS):
-            return []
-
     return missing
 
 
@@ -1509,6 +1504,8 @@ async def callbacks(callback: types.CallbackQuery):
                 except Exception:
                     pass
                 return
+        if not is_admin(_cb_user):
+            await db_set_cooldown(user_id, "operator")
         try:
             await callback.answer(f"✅ Записан на {slot_text}", show_alert=True)
         except Exception:
@@ -1695,6 +1692,29 @@ async def callbacks(callback: types.CallbackQuery):
         except Exception:
             pass
         await callback.message.answer("🔴 Чат закрыт.")
+        return
+
+    if callback.data == "edit_invalid_operator":
+        user_application_type[user_id] = "operator"
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+        await callback.message.answer(
+            "✏️ <b>Исправь заявку оператора</b>\n\n"
+            "Отправь все поля одним сообщением — пустые поля снова будут показаны отдельно:\n\n"
+            "Имя:\n"
+            "Возраст (и дата рождения):\n"
+            "Знание английского языка:\n"
+            "Модель процессора:\n"
+            "Модель видеокарты:\n"
+            "Скорость Интернета:\n"
+            "Где работал/ла:\n"
+            "Номер телефона (с кодом страны):\n"
+            "Телеграмм:\n"
+            "Кто привёл / откуда узнали о нас:",
+            reply_markup=cancel_keyboard()
+        )
         return
 
     if callback.data == "edit_operator_app":
@@ -2449,7 +2469,10 @@ async def handle_message(message: types.Message):
                 f"⚠️ <b>Анкета не заполнена до конца.</b>\n\n"
                 f"Отсутствуют поля:\n{fields_list}\n\n"
                 f"Дополни и отправь заново одним сообщением.",
-                reply_markup=cancel_keyboard()
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✏️ Изменить заявку", callback_data="edit_invalid_operator")],
+                    [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")],
+                ])
             )
             return
 
@@ -2500,9 +2523,6 @@ async def handle_message(message: types.Message):
         await message.answer("⚡ <b>Анкета обновлена.</b>\n\nИзменения сохранены.")
         return
 
-    if not is_admin(user):
-        await db_set_cooldown(user.id, app_type)
-
     iq_state = user_iq_state.pop(user.id, None)
     iq_score = iq_state["iq_score"] if iq_state else None
 
@@ -2544,7 +2564,6 @@ async def handle_message(message: types.Message):
                 reply_markup=interview_kb
             )
         else:
-            await db_set_cooldown(user.id, app_type)
             await message.answer(
                 "🌑 <b>Свободных дат пока нет.</b>\n\n"
                 "Собеседования временно недоступны. Попробуй позже."
@@ -2552,6 +2571,8 @@ async def handle_message(message: types.Message):
     else:
         for admin_id in ADMIN_IDS:
             await safe_send(admin_id, admin_message, reply_markup=admin_notify_keyboard(app_type, app_id))
+        if not is_admin(user):
+            await db_set_cooldown(user.id, app_type)
         await message.answer(
             "⚡ <b>Заявка принята.</b>\n\n"
             "Скоро с тобой свяжутся. Держи связь."
